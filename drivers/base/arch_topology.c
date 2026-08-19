@@ -41,6 +41,7 @@ bool topology_scale_freq_invariant(void)
 	return cpufreq_supports_freq_invariance() ||
 	       supports_scale_freq_counters(cpu_online_mask);
 }
+EXPORT_SYMBOL_GPL(topology_scale_freq_invariant);
 
 static void update_scale_freq_invariant(bool status)
 {
