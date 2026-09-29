@@ -1150,6 +1150,8 @@ struct scx_sched {
 	 * per-node split isn't sufficient, it can be further split.
 	 */
 	struct rhashtable	dsq_hash;
+	raw_spinlock_t		dsq_index_lock;
+	struct scx_dispatch_q __rcu **dsq_direct;
 	struct scx_sched_pnode	**pnode;
 	struct scx_sched_pcpu __percpu *pcpu;
 
