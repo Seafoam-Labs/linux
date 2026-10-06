@@ -1,5 +1,5 @@
 #!/bin/bash
-# tag-release.sh - Create signed Devario kernel tags in devario/linux
+# tag-release.sh - Create signed Devario kernel tags in devario-scx/linux
 # Usage: ./tag-release.sh <kernel-version> [pkgrel]
 # Example: ./tag-release.sh 6.19.3 1
 
@@ -12,15 +12,15 @@ Usage: $(basename "$0") <kernel-version> [pkgrel]
 Create a signed Devario release tag on the current branch.
 Tags the HEAD commit of whatever branch is currently checked out.
 
-Tag scheme: devario-<version>-<pkgrel>
+Tag scheme: devario-scx-<version>-<pkgrel>
 
   Kernel variant               Tag example
   ─────────────────────────────────────────────
-  Stable initial               devario-6.19.0-1
-  Stable point release         devario-6.19.3-1
-  Stable re-spin               devario-6.19.3-2
-  LTS                          devario-6.18.9-1
-  RC                           devario-6.19-rc8-1
+  Stable initial               devario-scx-6.19.0-1
+  Stable point release         devario-scx-6.19.3-1
+  Stable re-spin               devario-scx-6.19.3-2
+  LTS                          devario-scx-6.18.9-1
+  RC                           devario-scx-6.19-rc8-1
 
 Arguments:
   kernel-version   Kernel version (required)
@@ -71,7 +71,7 @@ if ! [[ "$PKGREL" =~ ^[0-9]+$ ]]; then
     exit 1
 fi
 
-TAG="devario-${VERSION}-${PKGREL}"
+TAG="devario-scx-${VERSION}-${PKGREL}"
 
 # Extract major.minor ("6.19" from "6.19.3" or "6.19-rc8")
 [[ "$VERSION" =~ ^([0-9]+\.[0-9]+) ]]
@@ -100,16 +100,16 @@ find_upstream_commit() {
     printf '%s' "$hash"
 }
 
-# Most recent devario-<major.minor>-* tag. Works across stable rebases
+# Most recent devario-scx-<major.minor>-* tag. Works across stable rebases
 # because it sorts by version name, not by ancestry.
 find_prev_tag() {
     local major_minor="$1"
-    git tag -l "devario-${major_minor}*" --sort=-v:refname 2>/dev/null | head -n1
+    git tag -l "devario-scx-${major_minor}*" --sort=-v:refname 2>/dev/null | head -n1
 }
 
-# Extract the kernel version out of a "devario-<ver>-<pkgrel>" tag.
+# Extract the kernel version out of a "devario-scx-<ver>-<pkgrel>" tag.
 tag_to_version() {
-    sed -E 's/^devario-(.+)-[0-9]+$/\1/' <<< "$1"
+    sed -E 's/^devario-scx-(.+)-[0-9]+$/\1/' <<< "$1"
 }
 
 # Enumerate first-parent merge commits of topic branches on top of <upstream>
