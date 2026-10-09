@@ -1264,6 +1264,11 @@ struct bpf_prog *bpf_patch_insn_single(struct bpf_prog *prog, u32 off,
 				       const struct bpf_insn *patch, u32 len);
 
 #ifdef CONFIG_BPF_SYSCALL
+u64 bpf_ctz64(u64 x);
+u64 bpf_popcnt64(u64 x);
+u64 bpf_clz64(u64 x);
+u64 bpf_mulhi64(u64 x, u64 y);
+
 struct bpf_prog *bpf_patch_insn_data(struct bpf_verifier_env *env, u32 off,
 				     const struct bpf_insn *patch, u32 len);
 struct bpf_insn_aux_data *bpf_dup_insn_aux_data(struct bpf_verifier_env *env);
