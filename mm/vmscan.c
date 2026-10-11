@@ -1086,8 +1086,7 @@ static enum folio_references folio_check_references(struct folio *folio,
 		if (hot_votes >= 2 || referenced_ptes > 1)
 			return FOLIOREF_ACTIVATE;
 
-		if (referenced_ptes > 0 && (vm_flags & VM_EXEC) &&
-		    						folio_is_file_lru(folio))
+		if (referenced_ptes > 0 && is_exec_file_folio(folio, &vma_flags))
 			return FOLIOREF_ACTIVATE;
 
 		if (hot_votes == 1 && referenced_folio && folio_is_file_lru(folio))
