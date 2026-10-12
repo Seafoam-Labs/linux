@@ -49,7 +49,6 @@
 #include <linux/ratelimit.h>
 #include <linux/task_work.h>
 #include <linux/rbtree_augmented.h>
-#include <linux/prefetch.h>
 
 #include <asm/switch_to.h>
 
@@ -8040,6 +8039,10 @@ static int dequeue_entities(struct rq *rq, struct sched_entity *se, int flags)
 	return 1;
 }
 
+#ifdef CONFIG_SCHED_POC_SELECTOR
+#include "poc_sync.h"
+#endif
+
 /*
  * The dequeue_task method is called before nr_running is
  * decreased. We remove the task from the rbtree and
@@ -8052,6 +8055,10 @@ static bool dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 		return true;
 	}
 
+#ifdef CONFIG_SCHED_POC_SELECTOR
+	if (flags & DEQUEUE_SLEEP)
+		poc_sync_note_sleep(rq, p);
+#endif
 	if (!p->se.sched_delayed)
 		util_est_dequeue(&rq->cfs, p);
 
@@ -8842,12 +8849,29 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target, int 
 	    choose_idle_cpu(recent_used_cpu, p) &&
 	    cpumask_test_cpu(recent_used_cpu, p->cpus_ptr)) {
 #ifdef CONFIG_SCHED_POC_SELECTOR
-		if (!static_branch_likely(&poc_selector_active) ||
-			static_branch_unlikely(&sched_poc_early_select))
+		if (poc_sync_recent_ok())
 #endif
 		if ((unsigned int)recent_used_cpu < nr_cpumask_bits &&
-		    is_idle_core(recent_used_cpu))
-			return recent_used_cpu;
+		    is_idle_core(recent_used_cpu)) {
+			/*
+			 * recent_used_cpu is the CPU the task ran on before
+			 * prev.  Never prefer it over an idle prev core, or a
+			 * task that wakes on an idle machine ping-pongs between
+			 * the two, paying a cold core on every wakeup.
+			 */
+			int cpu = recent_used_cpu;
+
+			if (cpumask_test_cpu(prev, p->cpus_ptr) &&
+			    cpus_share_cache(prev, target) && is_idle_core(prev))
+				cpu = prev;
+#ifdef CONFIG_SCHED_POC_SELECTOR
+			if (static_branch_likely(&poc_selector_active)) {
+				poc_count(cpu == prev ? POC_LV1P : POC_LV1R);
+				poc_commit_cpu(cpu);
+			}
+#endif
+			return cpu;
+		}
 	} else {
 		recent_used_cpu = -1;
 	}
@@ -8870,10 +8894,12 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target, int 
 
 #ifdef CONFIG_SCHED_POC_SELECTOR
 	if (static_branch_likely(&poc_selector_active) &&
-	    static_branch_unlikely(&sched_poc_early_select) &&
 	    is_idle_core(target) &&
-	    asym_fits_cpu(task_util, util_min, util_max, target))
+	    asym_fits_cpu(task_util, util_min, util_max, target)) {
+		poc_count(POC_LV1T);
+		poc_commit_cpu(target);
 		return target;
+	}
 #endif
 
 	/*
@@ -8918,43 +8944,15 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target, int 
 
 #ifdef CONFIG_SCHED_POC_SELECTOR
 	{
-		struct sched_domain_shared *sd_share =
-			rcu_dereference(per_cpu(sd_llc_shared, target));
-		if (static_branch_likely(&poc_selector_active)
-				&& !sched_asym_cpucap_active()
-				&& sd_share && likely(sd_share->poc_fast_eligible)) {
-			int poc_cpu = select_idle_cpu_poc(target, prev,
-					recent_used_cpu, sync,
-					sd_share, p->cpus_ptr);
-			if (poc_cpu >= 0) {
-				return poc_cpu;
-			}
-			/*
-			 * POC returns -2 when the SIS_UTIL overload gate fires
-			 * (smt_fallback=0 only). POC has already checked
-			 * prev's SMT sibling (Level 4) and decided broader
-			 * search is not worthwhile. CFS would reach the same
-			 * conclusion, so skip select_idle_smt/select_idle_cpu.
-			 *
-			 * POC returns -1 for Level 0 saturation (no idle CPUs
-			 * in bitmap), but CFS may still find sched_idle CPUs,
-			 * so we must NOT skip CFS in that case.
-			 */
-			if (poc_cpu == -2)
-				goto give_up;
-		} else {
-			/*
-			 * poc_selector_active is off — POC is either disabled
-			 * by sysctl or suppressed while scx is running.
-			 * If an scx scheduler called us, flip poc_selector_skip
-			 * and schedule a workqueue item to re-enable POC with
-			 * bitmap resync.
-			 */
-			poc_check_skip_fallback();
-		}
+		int poc_cpu = poc_select_idle_sibling(p, prev, target,
+						      recent_used_cpu);
+
+		if (poc_cpu >= 0)
+			return poc_cpu;
+		if (unlikely(poc_cpu == -2))
+			goto give_up;
 	}
-	poc_count(POC_FALLBACK);
-#endif /* CONFIG_SCHED_POC_SELECTOR */
+#endif
 
 	if ((unsigned int)recent_used_cpu < nr_cpumask_bits) {
 		if (choose_idle_cpu(recent_used_cpu, p)) {
@@ -9013,11 +9011,7 @@ give_up:
 		return recent_used_cpu;
 
 #ifdef CONFIG_SCHED_POC_SELECTOR
-	/* Last resort: avoid enqueuing behind RT/DL tasks on target */
-	if (static_branch_likely(&poc_selector_active) &&
-			rt_task(cpu_rq(target)->curr) &&
-			prev != target && !rt_task(cpu_rq(prev)->curr))
-		return prev;
+	target = poc_last_resort(prev, target);
 #endif
 	return target;
 }
@@ -9700,8 +9694,13 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
 		return sched_balance_find_dst_cpu(sd, p, cpu, prev_cpu, sd_flag);
 
 	/* Fast path */
-	if (wake_flags & WF_TTWU)
+	if (wake_flags & WF_TTWU) {
+#ifdef CONFIG_SCHED_POC_SELECTOR
+		if (static_branch_likely(&poc_selector_active))
+			return poc_select_wake_cpu(p, prev_cpu, new_cpu, sync);
+#endif
 		return select_idle_sibling(p, prev_cpu, new_cpu, sync);
+	}
 
 	return new_cpu;
 }
@@ -9872,6 +9871,10 @@ static void wakeup_preempt_fair(struct rq *rq, struct task_struct *p, int wake_f
 	struct sched_entity *nse, *se = &donor->se, *pse = &p->se;
 	struct cfs_rq *cfs_rq = task_cfs_rq(donor);
 	int cse_is_idle, pse_is_idle;
+#ifdef CONFIG_SCHED_POC_SELECTOR
+	/* the task running here, the waker if this is a local sync wake */
+	struct task_struct *curr = rq->curr;
+#endif
 
 	/*
 	 * XXX Getting preempted by higher class, try and find idle CPU?
@@ -9880,6 +9883,10 @@ static void wakeup_preempt_fair(struct rq *rq, struct task_struct *p, int wake_f
 	    donor->sched_class != &fair_sched_class)
 		return;
 
+#ifdef CONFIG_SCHED_POC_SELECTOR
+	if (poc_sync_wakee_waits(rq, curr, p, wake_flags))
+		return;
+#endif
 	if (unlikely(se == pse))
 		return;
 
