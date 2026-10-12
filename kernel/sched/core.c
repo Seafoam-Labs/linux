@@ -4590,6 +4590,10 @@ static void __sched_fork(u64 clone_flags, struct task_struct *p)
 	p->se.vlag			= 0;
 	p->se.rel_deadline		= 0;
 	INIT_LIST_HEAD(&p->se.group_node);
+#ifdef CONFIG_SCHED_POC_SELECTOR
+	/* no history yet: treat the new task's sync wakes as lies until proven */
+	p->poc_sync = POC_SYNC_INIT;
+#endif
 
 	/* A delayed task cannot be in clone(). */
 	WARN_ON_ONCE(p->se.sched_delayed);

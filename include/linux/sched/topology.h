@@ -101,27 +101,12 @@ struct sched_domain_shared {
 #endif
 
 	/*
-	 * Hot write path: idle state flag arrays (lock-free mode).
-	 * Each array = exactly 1 cache line (64B).
-	 * Writers: WRITE_ONCE (plain MOV, no LOCK prefix).
-	 * Readers: snapshot to stack, then multiply-and-shift aggregation.
-	 * Active only when sched_poc_atomic_bitmap=0.
+	 * Lazy commit: reader-facing busy mask + pending bits.
+	 * Readers: single atomic64_read (MOV on x86); idle = ~busy.
+	 * Writers: atomic_or / atomic64_set on the shared cacheline.
 	 */
-	u8		poc_idle_cpus[64] ____cacheline_aligned;
-#ifdef CONFIG_SCHED_SMT
-	u8		poc_idle_cores[64] ____cacheline_aligned;
-#endif /* CONFIG_SCHED_SMT */
-
-	/*
-	 * Hot read/write path: idle state bitmaps (bitmap mode, default).
-	 * Readers: single atomic64_read (MOV on x86).
-	 * Writers: atomic64_or / atomic64_andnot (LOCK'd on x86).
-	 * Active only when sched_poc_atomic_bitmap=1.
-	 */
-	atomic64_t	poc_idle_cpus_mask ____cacheline_aligned;
-#ifdef CONFIG_SCHED_SMT
-	atomic64_t	poc_idle_cores_mask ____cacheline_aligned;
-#endif /* CONFIG_SCHED_SMT */
+	atomic64_t	poc_busy_mask ____cacheline_aligned;
+	atomic_t	poc_pending[8] ____cacheline_aligned;	/* 8 chunks x 8 LLC CPUs */
 
 	/*
 	 * Read-only lookup tables (written once at init).
