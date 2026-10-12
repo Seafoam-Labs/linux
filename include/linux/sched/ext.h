@@ -11,6 +11,7 @@
 
 #ifdef CONFIG_SCHED_CLASS_EXT
 
+#include <linux/atomic.h>
 #include <linux/llist.h>
 #include <linux/rhashtable-types.h>
 
@@ -187,6 +188,7 @@ struct sched_ext_entity {
 #endif
 	struct scx_dispatch_q	*dsq;
 	atomic_long_t		ops_state;
+	atomic64_t		wake_signal;
 	u64			ddsp_dsq_id;
 	u64			ddsp_enq_flags;
 	struct scx_dsq_list_node dsq_list;	/* dispatch order */

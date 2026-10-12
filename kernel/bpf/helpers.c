@@ -4771,6 +4771,32 @@ __bpf_kfunc int bpf_timer_cancel_async(struct bpf_timer *timer)
 	}
 }
 
+/* Scalar bitops keep identical semantics on inline and fallback call paths. */
+__bpf_kfunc u64 bpf_ctz64(u64 x)
+{
+	return x ? __ffs64(x) : 64;
+}
+
+__bpf_kfunc u64 bpf_popcnt64(u64 x)
+{
+	return hweight64(x);
+}
+
+__bpf_kfunc u64 bpf_clz64(u64 x)
+{
+	return 64 - fls64(x);
+}
+
+__bpf_kfunc u64 bpf_mulhi64(u64 x, u64 y)
+{
+	u64 x0 = (u32)x, x1 = x >> 32, y0 = (u32)y, y1 = y >> 32;
+	u64 mid = x1 * y0 + ((x0 * y0) >> 32);
+	u64 carry = mid >> 32;
+
+	mid = (u32)mid + x0 * y1;
+	return x1 * y1 + carry + (mid >> 32);
+}
+
 __bpf_kfunc_end_defs();
 
 static void bpf_task_work_cancel_scheduled(struct irq_work *irq_work)
@@ -4971,6 +4997,16 @@ BTF_ID_FLAGS(func, bpf_task_work_schedule_resume, KF_IMPLICIT_ARGS)
 BTF_ID_FLAGS(func, bpf_dynptr_from_file)
 BTF_ID_FLAGS(func, bpf_dynptr_file_discard, KF_RELEASE)
 BTF_ID_FLAGS(func, bpf_timer_cancel_async)
+#if defined(CONFIG_X86_64) && defined(CONFIG_BPF_JIT)
+BTF_ID_FLAGS(func, bpf_ctz64, KF_FASTCALL)
+BTF_ID_FLAGS(func, bpf_popcnt64, KF_FASTCALL)
+BTF_ID_FLAGS(func, bpf_clz64, KF_FASTCALL)
+#else
+BTF_ID_FLAGS(func, bpf_ctz64)
+BTF_ID_FLAGS(func, bpf_popcnt64)
+BTF_ID_FLAGS(func, bpf_clz64)
+#endif
+BTF_ID_FLAGS(func, bpf_mulhi64)
 BTF_KFUNCS_END(common_btf_ids)
 
 static const struct btf_kfunc_id_set common_kfunc_set = {

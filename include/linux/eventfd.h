@@ -36,6 +36,8 @@ struct file *eventfd_fget(int fd);
 struct eventfd_ctx *eventfd_ctx_fdget(int fd);
 struct eventfd_ctx *eventfd_ctx_fileget(struct file *file);
 void eventfd_signal_mask(struct eventfd_ctx *ctx, __poll_t mask);
+void eventfd_signal_mask_flags(struct eventfd_ctx *ctx, __poll_t mask,
+			       int wake_flags);
 int eventfd_ctx_remove_wait_queue(struct eventfd_ctx *ctx, wait_queue_entry_t *wait,
 				  __u64 *cnt);
 void eventfd_ctx_do_read(struct eventfd_ctx *ctx, __u64 *cnt);
@@ -58,6 +60,11 @@ static inline struct eventfd_ctx *eventfd_ctx_fdget(int fd)
 }
 
 static inline void eventfd_signal_mask(struct eventfd_ctx *ctx, __poll_t mask)
+{
+}
+
+static inline void eventfd_signal_mask_flags(struct eventfd_ctx *ctx,
+					    __poll_t mask, int wake_flags)
 {
 }
 
@@ -90,4 +97,3 @@ static inline void eventfd_signal(struct eventfd_ctx *ctx)
 }
 
 #endif /* _LINUX_EVENTFD_H */
-
