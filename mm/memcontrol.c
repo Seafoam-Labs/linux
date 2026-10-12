@@ -28,6 +28,7 @@
 #include <linux/cgroup-defs.h>
 #include <linux/page_counter.h>
 #include <linux/memcontrol.h>
+#include <linux/lru_marie.h>
 #include <linux/cgroup.h>
 #include <linux/cpuset.h>
 #include <linux/sched/mm.h>
@@ -5312,6 +5313,26 @@ static void uncharge_folio(struct folio *folio, struct uncharge_gather *ug)
 		if (!obj_cgroup_is_root(objcg))
 			ug->nr_memory += nr_pages;
 		ug->pgpgout++;
+
+#ifdef CONFIG_LRU_MARIE
+		/*
+		 * Last point this folio's memcg is live: settle Marie's global
+		 * counters (marie_nr_folios + the lruvec's vmstat lru_size) for
+		 * any folio that escaped evict (scan bit still set). The
+		 * page-free hook that follows runs after memcg_data is zeroed
+		 * and cannot resolve the lruvec. No-op for the common case (bit
+		 * already retired by the normal evict path).
+		 *
+		 * 7.1: uncharge_folio is objcg-only (no memcg local). Resolve
+		 * the owning memcg from the pinned objcg under RCU --
+		 * obj_cgroup_memcg() requires it (objcg->memcg may be swapped to
+		 * the parent at reparent), and the read section keeps the
+		 * resolved memcg alive across the backstop's lruvec debit.
+		 */
+		rcu_read_lock();
+		lru_marie_uncharge_backstop(folio, obj_cgroup_memcg(objcg));
+		rcu_read_unlock();
+#endif
 
 		WARN_ON_ONCE(folio_unqueue_deferred_split(folio));
 	}

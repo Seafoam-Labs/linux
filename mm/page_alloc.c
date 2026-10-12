@@ -16,6 +16,7 @@
 
 #include <linux/stddef.h>
 #include <linux/mm.h>
+#include <linux/lru_marie.h>
 #include <linux/highmem.h>
 #include <linux/interrupt.h>
 #include <linux/jiffies.h>
@@ -1325,6 +1326,28 @@ static __always_inline bool __free_pages_prepare(struct page *page,
 
 	trace_mm_page_free(page, order);
 	kmsan_free_page(page, order);
+
+#ifdef CONFIG_LRU_MARIE
+	/*
+	 * Wipe Marie's per-PFN state at the buddy handoff. Marie's reclaim
+	 * isolate path intentionally leaves marie_state[pfn]'s TRACKED bit
+	 * set across shrink_folio_list (so install_local's TRACKED early-
+	 * out keeps blocking concurrent installs on the in-flight folio);
+	 * this hook is the canonical point at which that stale bit must
+	 * disappear so the next allocation at this PFN starts clean. No-op
+	 * when TRACKED is already 0 (normal Marie del path cleared it).
+	 * Only the head PFN ever carries TRACKED for compound folios.
+	 *
+	 * Gated on marie_state_ready() (latched at marie_state[] alloc),
+	 * NOT lru_marie_enabled(): a Marie disable transition flips the
+	 * enable key false while marie_drain is still walking the bitmaps,
+	 * and freed pages in that window must still have their stale
+	 * TRACKED bits wiped here -- otherwise the drain walk dereferences
+	 * a re-allocated folio's poisoned list head and oopses.
+	 */
+	if (marie_state_ready())
+		lru_marie_free_page_hook(page_to_pfn(page));
+#endif
 
 	if (memcg_kmem_online() && PageMemcgKmem(page))
 		__memcg_kmem_uncharge_page(page, order);
@@ -4636,25 +4659,58 @@ bool gfp_pfmemalloc_allowed(gfp_t gfp_mask)
 static inline bool
 should_reclaim_retry(gfp_t gfp_mask, unsigned order,
 		     struct alloc_context *ac, int alloc_flags,
-		     bool did_some_progress, int *no_progress_loops)
+		     unsigned long nr_progress, int *no_progress_loops)
 {
 	struct zone *zone;
 	struct zoneref *z;
 	bool ret = false;
+	unsigned long refaults, refault_delta;
+
+	/*
+	 * Thrash-aware progress accounting.
+	 *
+	 * "Reclaimed something" is not forward progress when the system is a
+	 * refault treadmill: every page reclaimed is somebody's working set
+	 * and gets pulled straight back in, evicting another working-set page
+	 * in turn. With a RAM-backed swap device (zram/zswap) this state is
+	 * stable indefinitely -- swap slots stay plentiful (zero-filled pages
+	 * are stored for free), so anon keeps counting as reclaimable, every
+	 * retry frees a few pages, no_progress_loops keeps resetting, and the
+	 * OOM killer never engages while userspace is completely starved.
+	 * This is the "browser + tail /dev/zero on zram" hard freeze.
+	 *
+	 * Detect the treadmill from the global workingset refault counters:
+	 * if the refaults that happened while we ran this retry loop exceed
+	 * a small multiple of what the loop actually reclaimed, the reclaim
+	 * was net-negative for everyone else and does not count as progress.
+	 * MAX_RECLAIM_RETRIES consecutive treadmill loops mean this
+	 * allocation is starving with no way out; let it fall through to the
+	 * regular OOM path regardless of how much nominal swap headroom the
+	 * backend advertises. Genuine cold-page reclaim (refaults ~0) and
+	 * bursty-but-recovering loads reset the counter as before.
+	 */
+	refaults = global_node_page_state(WORKINGSET_REFAULT_ANON) +
+		   global_node_page_state(WORKINGSET_REFAULT_FILE);
+	refault_delta = refaults - ac->last_refaults;
+	ac->last_refaults = refaults;
 
 	/*
 	 * Costly allocations might have made a progress but this doesn't mean
 	 * their order will become available due to high fragmentation so
 	 * always increment the no progress counter for them
 	 */
-	if (did_some_progress && order <= PAGE_ALLOC_COSTLY_ORDER)
+	if (nr_progress && order <= PAGE_ALLOC_COSTLY_ORDER &&
+	    refault_delta <= 4 * nr_progress + SWAP_CLUSTER_MAX)
 		*no_progress_loops = 0;
 	else
 		(*no_progress_loops)++;
 
-	if (*no_progress_loops > MAX_RECLAIM_RETRIES)
+	if (*no_progress_loops > MAX_RECLAIM_RETRIES) {
+		if (nr_progress && refault_delta > 4 * nr_progress)
+			pr_warn_ratelimited("reclaim thrash livelock: %lu refaults vs %lu reclaimed in final retry, invoking OOM\n",
+					    refault_delta, nr_progress);
 		goto out;
-
+	}
 
 	/*
 	 * Keep reclaiming pages while there is a chance this will lead
@@ -4820,6 +4876,9 @@ restart:
 	compact_priority = DEF_COMPACT_PRIORITY;
 	cpuset_mems_cookie = read_mems_allowed_begin();
 	zonelist_iter_cookie = zonelist_iter_begin();
+	/* baseline for should_reclaim_retry's thrash detection */
+	ac->last_refaults = global_node_page_state(WORKINGSET_REFAULT_ANON) +
+			    global_node_page_state(WORKINGSET_REFAULT_FILE);
 
 	/*
 	 * For costly allocations, try direct compaction first, as it's likely
@@ -4990,7 +5049,7 @@ retry:
 		goto restart;
 
 	if (should_reclaim_retry(gfp_mask, order, ac, alloc_flags,
-				 did_some_progress > 0, &no_progress_loops))
+				 did_some_progress, &no_progress_loops))
 		goto retry;
 
 	/*
