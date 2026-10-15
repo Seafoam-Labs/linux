@@ -199,6 +199,7 @@
 #include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/sched/signal.h>
+#include <linux/sched/wake_signal.h>
 #include <linux/sync_file.h>
 #include <linux/uaccess.h>
 
@@ -1007,7 +1008,7 @@ static void syncobj_wait_fence_func(struct dma_fence *fence,
 	struct syncobj_wait_entry *wait =
 		container_of(cb, struct syncobj_wait_entry, fence_cb);
 
-	wake_up_process(wait->task);
+	wake_up_state_signal(wait->task, TASK_NORMAL, WF_SCX_FENCE);
 }
 
 static void syncobj_wait_syncobj_func(struct drm_syncobj *syncobj,
@@ -1412,7 +1413,7 @@ static void syncobj_eventfd_entry_fence_func(struct dma_fence *fence,
 	struct syncobj_eventfd_entry *entry =
 		container_of(cb, struct syncobj_eventfd_entry, fence_cb);
 
-	eventfd_signal(entry->ev_fd_ctx);
+	eventfd_signal_mask_flags(entry->ev_fd_ctx, 0, WF_SCX_FENCE);
 	syncobj_eventfd_entry_free(entry);
 }
 
@@ -1452,7 +1453,7 @@ syncobj_eventfd_entry_func(struct drm_syncobj *syncobj,
 		ret = dma_fence_add_callback(fence, &entry->fence_cb,
 					     syncobj_eventfd_entry_fence_func);
 		if (ret == -ENOENT) {
-			eventfd_signal(entry->ev_fd_ctx);
+			eventfd_signal_mask_flags(entry->ev_fd_ctx, 0, WF_SCX_FENCE);
 			syncobj_eventfd_entry_free(entry);
 		}
 	}
