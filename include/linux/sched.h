@@ -816,6 +816,26 @@ struct wake_q_node {
 	struct wake_q_node *next;
 };
 
+#ifdef CONFIG_SCHED_POC_SELECTOR
+/* Learned WF_SYNC honesty of a waker, see kernel/sched/fair.c */
+struct poc_sync {
+	u64				mark;		/* own exec at the pending sync wake + 1, 0 = none */
+	u16				hist;		/* last 16 resolved sync wakes, bit = 1: a lie */
+	u16				chain;		/* same 16, bit = 1: more sync wakes joined it */
+	u8				lie_log2;	/* log2 of how long a lie ran on, in ns, rounded up */
+	u8				on_waker_cpu:1;	/* pending wake's wakee on our CPU may preempt us */
+	u8				sampled:1;	/* hist holds at least one resolved sync wake */
+	u8				joined:1;	/* the pending wake has had others join it */
+	u8				explore:4;	/* preemptible handoffs, wraps: 0 = sample one */
+};
+
+/*
+ * a new task: 16 lies of 16us each, so it earns a handoff by 16 honest wakes;
+ * no chained wakes, as only an observed one should count
+ */
+#define POC_SYNC_INIT	((struct poc_sync){ .hist = 0xffff, .lie_log2 = 14 })
+#endif
+
 struct kmap_ctrl {
 #ifdef CONFIG_KMAP_LOCAL
 	int				idx;
@@ -878,6 +898,9 @@ struct task_struct {
 	unsigned int			rt_priority;
 
 	struct sched_entity		se;
+#ifdef CONFIG_SCHED_POC_SELECTOR
+	struct poc_sync			poc_sync;
+#endif
 	struct sched_rt_entity		rt;
 	struct sched_dl_entity		dl;
 	struct sched_dl_entity		*dl_server;
