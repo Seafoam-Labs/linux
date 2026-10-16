@@ -1400,12 +1400,19 @@ static void lruvec_reparent_lru(struct lruvec *child_lruvec,
 {
 	int zid;
 	struct zone *zone;
+	struct mem_cgroup_per_node *mz;
 
 	if (lru != LRU_UNEVICTABLE)
 		list_splice_tail_init(&child_lruvec->lists[lru], &parent_lruvec->lists[lru]);
 
+	/*
+	 * Move the child's own count. Marie makes the accessor return the
+	 * node-global size, which would drive the child negative.
+	 */
+	mz = container_of(child_lruvec, struct mem_cgroup_per_node, lruvec);
+
 	for_each_managed_zone_pgdat(zone, NODE_DATA(nid), zid, MAX_NR_ZONES - 1) {
-		unsigned long size = mem_cgroup_get_zone_lru_size(child_lruvec, lru, zid);
+		unsigned long size = READ_ONCE(mz->lru_zone_size[zid][lru]);
 
 		if (!size)
 			continue;
