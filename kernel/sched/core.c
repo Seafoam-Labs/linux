@@ -673,7 +673,7 @@ void raw_spin_rq_lock_nested(struct rq *rq, int subclass)
 
 	/* Matches synchronize_rcu() in __sched_core_enable() */
 	preempt_disable();
-	if (sched_core_disabled()) {
+	if (likely(sched_core_disabled())) {
 		raw_spin_lock_nested(&rq->__lock, subclass);
 		/* preempt_count *MUST* be > 1 */
 		preempt_enable_no_resched();
@@ -885,7 +885,7 @@ void update_rq_clock(struct rq *rq)
 	scx_rq_clock_update(rq, clock);
 
 	delta = clock - rq->clock;
-	if (delta < 0)
+	if (unlikely(delta < 0))
 		return;
 	rq->clock += delta;
 
@@ -4596,6 +4596,10 @@ static void __sched_fork(u64 clone_flags, struct task_struct *p)
 	p->se.vlag			= 0;
 	p->se.rel_deadline		= 0;
 	INIT_LIST_HEAD(&p->se.group_node);
+#ifdef CONFIG_SCHED_POC_SELECTOR
+	/* no history yet: treat the new task's sync wakes as lies until proven */
+	p->poc_sync = POC_SYNC_INIT;
+#endif
 
 	/* A delayed task cannot be in clone(). */
 	WARN_ON_ONCE(p->se.sched_delayed);
@@ -6254,7 +6258,7 @@ pick_next_task(struct rq *rq, struct rq_flags *rf)
 	struct rq *rq_i;
 	bool need_sync = false;
 
-	if (!sched_core_enabled(rq))
+	if (likely(!sched_core_enabled(rq)))
 		return __pick_next_task(rq, rf);
 
 	cpu = cpu_of(rq);
@@ -7802,7 +7806,7 @@ out_unlock:
 #if !defined(CONFIG_PREEMPTION) || defined(CONFIG_PREEMPT_DYNAMIC)
 int __sched __cond_resched(void)
 {
-	if (should_resched(0) && !irqs_disabled()) {
+	if (unlikely(should_resched(0) && !irqs_disabled())) {
 		preempt_schedule_common();
 		return 1;
 	}
