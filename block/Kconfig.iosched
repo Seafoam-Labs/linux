@@ -16,6 +16,20 @@ config MQ_IOSCHED_KYBER
 	  synchronous writes, it will self-tune queue depths to achieve that
 	  goal.
 
+config MQ_IOSCHED_KPP
+	tristate "KPP I/O scheduler"
+	default y
+	help
+	  The KPP (kyber++) I/O scheduler is a low-overhead scheduler suitable
+	  for multiqueue and other fast devices. Given target latencies for
+	  reads and synchronous writes, it will self-tune queue depths to
+	  achieve that goal.
+
+	  KPP adds bounded LIFO reuse on top of Kyber token logic: most
+	  inserts reuse the head for locality, with every 8th insert going
+	  to the tail to bound starvation. Queue depths, latency targets and
+	  batch sizes are identical to Kyber. No new tunables.
+
 config MQ_IOSCHED_ADIOS
 	tristate "Adaptive Deadline I/O scheduler"
 	default m
