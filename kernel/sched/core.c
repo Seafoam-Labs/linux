@@ -39,6 +39,7 @@
 #include <linux/sched/nohz.h>
 #include <linux/sched/rseq_api.h>
 #include <linux/sched/rt.h>
+#include <linux/sched/wake_signal.h>
 
 #include <linux/context_tracking.h>
 #include <linux/cpuset.h>
@@ -4378,6 +4379,7 @@ int try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
 		 * enqueue, such as ttwu_queue_wakelist().
 		 */
 		WRITE_ONCE(p->__state, TASK_WAKING);
+		scx_record_wake_signal(p, wake_flags);
 
 		/*
 		 * If the owning (remote) CPU is still in the middle of schedule() with
@@ -4570,6 +4572,14 @@ int wake_up_process(struct task_struct *p)
 	return try_to_wake_up(p, TASK_NORMAL, 0);
 }
 EXPORT_SYMBOL(wake_up_process);
+
+/* Tag only accepted wakeups of a blocked task; preserve normal wake semantics. */
+int wake_up_state_signal(struct task_struct *p, unsigned int state,
+			 unsigned int signal)
+{
+	return try_to_wake_up(p, state, signal & WF_SCX_SIGNAL_MASK);
+}
+EXPORT_SYMBOL_GPL(wake_up_state_signal);
 
 int wake_up_state(struct task_struct *p, unsigned int state)
 {
@@ -7614,7 +7624,7 @@ asmlinkage __visible void __sched preempt_schedule_irq(void)
 int default_wake_function(wait_queue_entry_t *curr, unsigned mode, int wake_flags,
 			  void *key)
 {
-	WARN_ON_ONCE(wake_flags & ~(WF_SYNC|WF_CURRENT_CPU));
+	WARN_ON_ONCE(wake_flags & ~(WF_SYNC|WF_CURRENT_CPU|WF_SCX_SIGNAL_MASK));
 	return try_to_wake_up(curr->private, mode, wake_flags);
 }
 EXPORT_SYMBOL(default_wake_function);
