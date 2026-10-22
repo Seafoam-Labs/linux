@@ -1618,6 +1618,8 @@ struct scx_sched {
 	 * per-node split isn't sufficient, it can be further split.
 	 */
 	struct rhashtable	dsq_hash;
+	raw_spinlock_t		dsq_index_lock;
+	struct scx_dispatch_q __rcu **dsq_direct;
 	struct scx_sched_pnode	**pnode;
 #ifdef CONFIG_EXT_SUB_SCHED
 	struct scx_pshard	**pshard;	/* indexed by shard_idx */
