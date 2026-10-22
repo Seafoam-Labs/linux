@@ -1,16 +1,21 @@
 #!/bin/bash
-# tag-release.sh - Create signed Devario kernel release tags in Seafoam-Labs/linux
+# release-kernel.sh - Create signed Devario kernel release tags in Seafoam-Labs/linux
 #
-# Usage: ./tag-release.sh [options] <kernel-version> [pkgrel]
-#   ./tag-release.sh 6.19.3
-#   ./tag-release.sh 6.19.3 2
-#   ./tag-release.sh --dry-run 6.19-rc8
+# Usage: ./release-kernel.sh [options] <kernel-version> [pkgrel]
+#   ./release-kernel.sh 6.19.3              -> devario-6.19.3-1
+#   ./release-kernel.sh 6.19.3 2            -> devario-6.19.3-2
+#   ./release-kernel.sh --dev 7.2.3         -> devario-dev-7.2.3-1
+#   ./release-kernel.sh --scx 7.2.3         -> devario-scx-7.2.3-1
+#   ./release-kernel.sh --dry-run 6.19-rc8
 
 set -euo pipefail
 
 readonly SCRIPT_NAME=${0##*/}
-readonly TAG_PREFIX="devario"
-readonly RELEASE_TITLE="Devario Linux"
+# Release channel: "" (stable), "dev" or "scx"; set by --dev / --scx.
+# Selects the tag prefix (devario[-<channel>]) and the release title.
+CHANNEL=""
+TAG_PREFIX="devario"
+RELEASE_TITLE="Devario Linux"
 
 # ---------------------------------------------------------------------------
 # Output helpers
@@ -46,17 +51,28 @@ then optionally push it and publish a GitHub release with a signed tarball.
 
   Kernel variant          Tag
   ─────────────────────────────────────────
-  Stable initial          ${TAG_PREFIX}-6.19.0-1
-  Stable point release    ${TAG_PREFIX}-6.19.3-1
-  Stable re-spin          ${TAG_PREFIX}-6.19.3-2
-  LTS                     ${TAG_PREFIX}-6.18.9-1
-  RC                      ${TAG_PREFIX}-6.19-rc8-1
+  Stable initial          devario-6.19.0-1
+  Stable point release    devario-6.19.3-1
+  Stable re-spin          devario-6.19.3-2
+  LTS                     devario-6.18.9-1
+  RC                      devario-6.19-rc8-1
+  Dev build (--dev)       devario-dev-7.2.3-1
+  scx kernel (--scx)      devario-scx-7.2.3-1
+
+Each channel (devario-*, devario-dev-*, devario-scx-*) is a separate line
+of tags: "previous release" and the changelog diff are computed only
+within the same channel.
 
 Arguments:
   kernel-version   X.Y.Z (6.19.3) or X.Y-rcN (6.19-rc8)
   pkgrel           Package release number (default: 1)
 
 Options:
+  -d, --dev        Dev channel: tag devario-dev-<version>-<pkgrel>, release
+                   titled "Devario Linux (dev) <version>-<pkgrel>"
+  -s, --scx        scx channel: tag devario-scx-<version>-<pkgrel>, release
+                   titled "Devario Linux (scx) <version>-<pkgrel>"
+                   (--dev and --scx are mutually exclusive)
   -n, --dry-run    Only print the generated changelog, change nothing
   -y, --yes        Do not ask for confirmation
   -r, --resume     Publish an already existing local tag: verify its
@@ -77,7 +93,7 @@ Checks performed before tagging (all fatal):
 Recovering a half-finished publish:
   If the script fails after the tag was created (push, signing or
   'gh release' error), fix the cause and re-run with --resume:
-      ${SCRIPT_NAME} --resume <kernel-version> [pkgrel]
+      ${SCRIPT_NAME} [--dev|--scx] --resume <kernel-version> [pkgrel]
 
 Requirements:
   - A GPG key configured via 'git config user.signingkey' for the tag.
@@ -100,8 +116,15 @@ ASSUME_YES=0
 RESUME=0
 POSITIONAL=()
 
+set_channel() {
+    [[ -z $CHANNEL || $CHANNEL == "$1" ]] || die "--dev and --scx are mutually exclusive"
+    CHANNEL=$1
+}
+
 while [[ $# -gt 0 ]]; do
     case $1 in
+        -d|--dev)     set_channel dev ;;
+        -s|--scx)     set_channel scx ;;
         -n|--dry-run) DRY_RUN=1 ;;
         -y|--yes)     ASSUME_YES=1 ;;
         -r|--resume)  RESUME=1 ;;
@@ -115,6 +138,12 @@ done
 
 VERSION=${POSITIONAL[0]:-}
 PKGREL=${POSITIONAL[1]:-1}
+
+if [[ -n $CHANNEL ]]; then
+    TAG_PREFIX="devario-${CHANNEL}"
+    RELEASE_TITLE="Devario Linux (${CHANNEL})"
+fi
+readonly CHANNEL TAG_PREFIX RELEASE_TITLE
 
 [[ -n $VERSION ]] || { usage >&2; exit 1; }
 [[ $VERSION =~ ^[0-9]+\.[0-9]+(\.[0-9]+|-rc[0-9]+)$ ]] \
@@ -495,5 +524,5 @@ echo
 if confirm "Push tag and create GitHub release?"; then
     publish_release
 else
-    info "tag left local - publish later with: ${SCRIPT_NAME} --resume ${VERSION} ${PKGREL}"
+    info "tag left local - publish later with: ${SCRIPT_NAME} --resume${CHANNEL:+ --${CHANNEL}} ${VERSION} ${PKGREL}"
 fi
