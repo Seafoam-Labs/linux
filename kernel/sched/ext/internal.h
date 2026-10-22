@@ -184,6 +184,24 @@ enum scx_ops_flags {
 	 */
 	SCX_OPS_TID_TO_TASK		= 1LLU << 8,
 
+	/* Root opts in to typed blocked-task wake metadata. */
+	SCX_OPS_WAKE_SIGNAL		= 1LLU << 9,
+
+	/*
+	 * Lean built-in idle tracking. Applies when the global idle cpumask is
+	 * used and nr_cpu_ids <= BITS_PER_LONG; otherwise the flag is ignored.
+	 * The idle CPU and idle SMT words share one cacheline that holds
+	 * nothing else, claims use single-word operations without RCU or
+	 * out-of-line helpers, and idle transitions test before they write.
+	 */
+	SCX_OPS_LEAN_IDLE		= 1LLU << 10,
+
+	/*
+	 * With %SCX_OPS_LEAN_IDLE, a successful claim leaves the idle SMT word
+	 * to the claimed CPU's busy transition. A failed claim still clears it.
+	 */
+	SCX_OPS_LEAN_IDLE_LAZY_SMT	= 1LLU << 11,
+
 	SCX_OPS_ALL_FLAGS		= SCX_OPS_KEEP_BUILTIN_IDLE |
 					  SCX_OPS_ENQ_LAST |
 					  SCX_OPS_ENQ_EXITING |
@@ -192,7 +210,10 @@ enum scx_ops_flags {
 					  SCX_OPS_SWITCH_PARTIAL |
 					  SCX_OPS_BUILTIN_IDLE_PER_NODE |
 					  SCX_OPS_ALWAYS_ENQ_IMMED |
-					  SCX_OPS_TID_TO_TASK,
+					  SCX_OPS_TID_TO_TASK |
+					  SCX_OPS_WAKE_SIGNAL |
+					  SCX_OPS_LEAN_IDLE |
+					  SCX_OPS_LEAN_IDLE_LAZY_SMT,
 
 	/* high 8 bits are internal, don't include in SCX_OPS_ALL_FLAGS */
 	__SCX_OPS_INTERNAL_MASK		= 0xffLLU << 56,
@@ -1150,6 +1171,8 @@ struct scx_sched {
 	 * per-node split isn't sufficient, it can be further split.
 	 */
 	struct rhashtable	dsq_hash;
+	raw_spinlock_t		dsq_index_lock;
+	struct scx_dispatch_q __rcu **dsq_direct;
 	struct scx_sched_pnode	**pnode;
 	struct scx_sched_pcpu __percpu *pcpu;
 
