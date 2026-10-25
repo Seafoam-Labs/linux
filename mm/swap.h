@@ -259,10 +259,6 @@ void swap_read_submit(struct swap_io_ctx *ctx);
 void swap_write_submit(struct swap_io_ctx *ctx);
 int swap_writeout(struct swap_io_ctx *ctx, struct folio *folio);
 void __swap_writepage(struct swap_io_ctx *ctx, struct folio *folio);
-#ifdef CONFIG_LRU_MARIE
-/* CONFIG_SWAP is implied by this branch (mm/swap.h's CONFIG_SWAP gate). */
-int kcompressd(void *p);
-#endif
 
 /* linux/mm/swap_state.c */
 extern struct address_space swap_space __read_mostly;
