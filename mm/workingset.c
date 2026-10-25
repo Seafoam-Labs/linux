@@ -6,6 +6,7 @@
  */
 
 #include <linux/memcontrol.h>
+#include <linux/lru_cast.h>
 #include <linux/mm_inline.h>
 #include <linux/writeback.h>
 #include <linux/shmem_fs.h>
@@ -183,6 +184,7 @@
 
 #define WORKINGSET_SHIFT 1
 #define EVICTION_SHIFT	((BITS_PER_LONG - BITS_PER_XA_VALUE) +	\
+			 LRU_CAST_SHADOW_KIND + \
 			 WORKINGSET_SHIFT + NODES_SHIFT + \
 			 MEM_CGROUP_ID_SHIFT)
 #define EVICTION_SHIFT_ANON	(EVICTION_SHIFT + SWAP_COUNT_SHIFT)
@@ -206,6 +208,7 @@ static void *pack_shadow(int memcgid, pg_data_t *pgdat, unsigned long eviction,
 	eviction = (eviction << MEM_CGROUP_ID_SHIFT) | memcgid;
 	eviction = (eviction << NODES_SHIFT) | pgdat->node_id;
 	eviction = (eviction << WORKINGSET_SHIFT) | workingset;
+	eviction <<= LRU_CAST_SHADOW_KIND;	/* clear: not CAST's */
 
 	return xa_mk_value(eviction);
 }
@@ -217,6 +220,7 @@ static void unpack_shadow(void *shadow, int *memcgidp, pg_data_t **pgdat,
 	int memcgid, nid;
 	bool workingset;
 
+	entry >>= LRU_CAST_SHADOW_KIND;
 	workingset = entry & ((1UL << WORKINGSET_SHIFT) - 1);
 	entry >>= WORKINGSET_SHIFT;
 	nid = entry & ((1UL << NODES_SHIFT) - 1);
@@ -405,6 +409,9 @@ void *workingset_eviction(struct folio *folio, struct mem_cgroup *target_memcg)
 	if (lru_gen_enabled())
 		return lru_gen_eviction(folio);
 
+	if (lru_cast_enabled())
+		return lru_cast_eviction(folio);
+
 	lruvec = mem_cgroup_lruvec(target_memcg, pgdat);
 	/* XXX: target_memcg can be NULL, go through lruvec */
 	memcgid = mem_cgroup_private_id(lruvec_memcg(lruvec));
@@ -447,6 +454,15 @@ bool workingset_test_recent(void *shadow, bool file, bool *workingset,
 					     workingset, file);
 		rcu_read_unlock();
 		return recent;
+	}
+
+	if (lru_cast_enabled())
+		return lru_cast_test_recent(shadow, file, workingset);
+
+	/* left by CAST before it was switched off: no history here */
+	if (lru_cast_shadow(shadow)) {
+		*workingset = false;
+		return false;
 	}
 
 	rcu_read_lock();
@@ -557,6 +573,11 @@ void workingset_refault(struct folio *folio, void *shadow)
 
 	if (lru_gen_enabled()) {
 		lru_gen_refault(folio, shadow);
+		return;
+	}
+
+	if (lru_cast_enabled()) {
+		lru_cast_refault(folio, shadow);
 		return;
 	}
 

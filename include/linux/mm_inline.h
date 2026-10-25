@@ -9,6 +9,7 @@
 #include <linux/string.h>
 #include <linux/userfaultfd_k.h>
 #include <linux/leafops.h>
+#include <linux/lru_cast.h>
 
 /**
  * folio_is_file_lru - Should the folio be on a file LRU or anon LRU?
@@ -346,12 +347,15 @@ static inline void folio_migrate_refs(struct folio *new, const struct folio *old
 static __always_inline
 void lruvec_add_folio(struct lruvec *lruvec, struct folio *folio)
 {
-	enum lru_list lru = folio_lru_list(folio);
+	enum lru_list lru;
 
 	VM_WARN_ON_ONCE_FOLIO(!folio_matches_lruvec(folio, lruvec), folio);
 
 	if (lru_gen_add_folio(lruvec, folio, false))
 		return;
+	if (lru_cast_add_folio(lruvec, folio, false))
+		return;
+	lru = folio_lru_list(folio);
 
 	update_lru_size(lruvec, lru, folio_zonenum(folio),
 			folio_nr_pages(folio));
@@ -362,12 +366,15 @@ void lruvec_add_folio(struct lruvec *lruvec, struct folio *folio)
 static __always_inline
 void lruvec_add_folio_tail(struct lruvec *lruvec, struct folio *folio)
 {
-	enum lru_list lru = folio_lru_list(folio);
+	enum lru_list lru;
 
 	VM_WARN_ON_ONCE_FOLIO(!folio_matches_lruvec(folio, lruvec), folio);
 
 	if (lru_gen_add_folio(lruvec, folio, true))
 		return;
+	if (lru_cast_add_folio(lruvec, folio, true))
+		return;
+	lru = folio_lru_list(folio);
 
 	update_lru_size(lruvec, lru, folio_zonenum(folio),
 			folio_nr_pages(folio));

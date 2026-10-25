@@ -1401,6 +1401,17 @@ config PTE_MARKER_UFFD_WP
 	  file-backed memory types like shmem and hugetlbfs.
 
 # multi-gen LRU {
+config LRU_CAST
+	bool "CAST page replacement"
+	depends on 64BIT && MMU && SPARSEMEM && !LRU_GEN
+	default y
+	help
+	  A replacement for the active/inactive LRU lists: newcomers wait in
+	  a FIFO window, the rest are ranked by their exponentially decayed
+	  read count, kept in buckets of a key that does not change while a
+	  folio is not read (CAST). It keeps a 32-bit word per page
+	  frame, 1/1024 of memory, set up when it first runs.
+
 config LRU_GEN
 	bool "Multi-Gen LRU"
 	depends on MMU

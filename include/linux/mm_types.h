@@ -1419,6 +1419,15 @@ struct mm_struct {
 #ifdef CONFIG_MM_ID
 		mm_id_t mm_id;
 #endif /* CONFIG_MM_ID */
+#ifdef CONFIG_LRU_CAST
+		/*
+		 * Set when a CPU runs this mm_struct (switching to it, or
+		 * ticking in it), cleared by CAST's walker: unset, no
+		 * young bit can have been set in its page tables since the
+		 * last walk.
+		 */
+		unsigned long lru_cast_used;
+#endif
 	} __randomize_layout;
 
 	/*
@@ -1541,6 +1550,18 @@ static inline void lru_gen_use_mm(struct mm_struct *mm)
 }
 
 #endif /* CONFIG_LRU_GEN_WALKS_MMU */
+
+#ifdef CONFIG_LRU_CAST
+static inline void lru_cast_use_mm(struct mm_struct *mm)
+{
+	if (mm && !READ_ONCE(mm->lru_cast_used))
+		WRITE_ONCE(mm->lru_cast_used, 1);
+}
+#else
+static inline void lru_cast_use_mm(struct mm_struct *mm)
+{
+}
+#endif
 
 struct vma_iterator {
 	struct ma_state mas;

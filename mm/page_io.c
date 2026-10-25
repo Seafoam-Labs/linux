@@ -26,6 +26,8 @@
 #include <linux/delayacct.h>
 #include <linux/zswap.h>
 #include <linux/swap_ops.h>
+#include <linux/kfifo.h>
+#include <linux/lru_cast.h>
 #include "swap.h"
 #include "swap_table.h"
 
@@ -198,10 +200,147 @@ static void swap_zeromap_folio_clear(struct folio *folio)
 }
 
 /*
+ * do_swapout() - Write a folio to swap space
+ * @ctx: swap IO batching context (7.3: replaces the old swap_iocb **plug)
+ * @folio: The folio to write out
+ *
+ * This function writes the folio to swap space, either using zswap or
+ * the block/fs swap writeback path. It ensures that the folio is
+ * unlocked and the reference count is decremented after the operation.
+ */
+static inline void do_swapout(struct swap_io_ctx *ctx, struct folio *folio)
+{
+	if (zswap_store(folio)) {
+		count_mthp_stat(folio_order(folio), MTHP_STAT_ZSWPOUT);
+		folio_unlock(folio);
+	} else
+		__swap_writepage(ctx, folio); /* Implies folio_unlock(folio) */
+
+	/* Decrement the folio reference count */
+	folio_put(folio);
+}
+
+#ifdef CONFIG_LRU_CAST
+/*
+ * do_swapout_batch() - Write a drained kcompressd batch out to swap.
+ *
+ * 7.3 rework: mm/page_io.c now owns a generic swap_iocb batching layer
+ * (swap_add_folio() + ->can_merge()), so the hand-rolled multi-segment
+ * bio builder this used to carry (swap_writepage_bdev_sync_batch() and
+ * __end_swap_bio_write_batch(), both against the now-deleted
+ * swap_writepage_bdev_sync()) is gone. Instead we share ONE swap_io_ctx
+ * across the whole drained batch and set ctx.defer_sync_submit, which
+ * suppresses swap_add_folio()'s force-submit-per-folio on
+ * SWP_SYNCHRONOUS_IO devices (zram). Contiguous same-device folios then
+ * coalesce into one multi-segment bio exactly as before, using upstream's
+ * own (stricter, blkcg-aware) merge test. The trailing swap_write_submit()
+ * drains the tail; for SWP_SYNCHRONOUS_IO that is submit_bio_wait(), so
+ * writeback is still cleared synchronously before we return, matching the
+ * previous behaviour.
+ *
+ * The force-submit is safe to defer here only because kcompressd is not
+ * itself the reclaimer: it runs on its own kthread with a reference the
+ * enqueue side took, so nothing is waiting on the folio's writeback bit
+ * to make reclaim progress.
+ */
+static void do_swapout_batch(struct folio **folios, unsigned int n)
+{
+	struct swap_io_ctx ctx = { .defer_sync_submit = true };
+	unsigned int i;
+
+	for (i = 0; i < n; i++)
+		do_swapout(&ctx, folios[i]);
+
+	swap_write_submit(&ctx);
+}
+
+/*
+ * kcompressd_store() - Off-load folio compression to kcompressd
+ * @folio: The folio to compress
+ * @handoff: pageout()'s: the folio's reclaim may go with it
+ *
+ * This function attempts to off-load the compression of the folio to
+ * kcompressd. If kcompressd is not available or the folio cannot be
+ * compressed, it falls back to synchronous write.
+ *
+ * Returns true if the folio was successfully queued for compression,
+ * false otherwise.
+ */
+static bool kcompressd_store(struct folio *folio, bool handoff)
+{
+	pg_data_t *pgdat = NODE_DATA(numa_node_id());
+
+	/*
+	 * Only kswapd's pageout() hands a folio over, its reclaim with it;
+	 * kcompressd finishing that reclaim writes what it finds dirty itself
+	 */
+	if (!handoff || !current_is_kswapd() || current == pgdat->kcompressd)
+		return false;
+
+	/* Mode 0, or mode 1 with CAST off — short-circuit on the static branches. */
+	if (!kcompressd_active())
+		return false;
+
+	/* kthread must be running */
+	if (unlikely(!pgdat->kcompressd))
+		return false;
+
+	/* We can only off-load anon folios */
+	if (!folio_test_anon(folio))
+		return false;
+
+	/* Fall back to synchronously return AOP_WRITEPAGE_ACTIVATE.
+	 * folio_memcg -> obj_cgroup_memcg requires RCU read-side held to
+	 * keep objcg from being freed by a concurrent memcg teardown
+	 * (lockdep_assert_once in obj_cgroup_memcg). */
+	{
+		bool zswap_wb_ok;
+
+		rcu_read_lock();
+		zswap_wb_ok = mem_cgroup_zswap_writeback_enabled(folio_memcg(folio));
+		rcu_read_unlock();
+		if (!zswap_wb_ok)
+			return false;
+	}
+
+	/* Swap device must be sync-efficient */
+	if (!zswap_is_enabled() &&
+		!data_race(__swap_entry_to_info(folio->swap)->flags & SWP_SYNCHRONOUS_IO))
+		return false;
+
+	/*
+	 * The kfifo backing storage is sized at KCOMPRESSD_FIFO_SIZE (the
+	 * compile-time max). The effective queue depth is |vm_kcompressd|;
+	 * at that depth kswapd writes the folio itself. kswapd is the only
+	 * producer, kcompressd the only consumer.
+	 */
+	if (kfifo_len(&pgdat->kcompressd_fifo) >=
+	    abs(READ_ONCE(vm_kcompressd)) * sizeof(struct folio *))
+		return false;
+
+	/* Increment the folio reference count to avoid it being freed */
+	folio_get(folio);
+
+	/* Enqueue the folio for compression */
+	if (unlikely(!kfifo_in(&pgdat->kcompressd_fifo, &folio, sizeof(folio)))) {
+		folio_put(folio);
+		return false;
+	}
+	wake_up_interruptible(&pgdat->kcompressd_wait);
+	return true;
+}
+#else  /* !CONFIG_LRU_CAST */
+static inline bool kcompressd_store(struct folio *folio, bool handoff)
+{
+	return false;
+}
+#endif
+
+/*
  * We may have stale swap cache pages in memory: notice
  * them here and get rid of the unnecessary final write.
  */
-int swap_writeout(struct swap_io_ctx *ctx, struct folio *folio)
+static int __swap_writeout(struct swap_io_ctx *ctx, struct folio *folio, bool handoff)
 {
 	int ret = 0;
 
@@ -235,6 +374,14 @@ int swap_writeout(struct swap_io_ctx *ctx, struct folio *folio)
 	 */
 	swap_zeromap_folio_clear(folio);
 
+	/*
+	 * Compression within zswap and zram might block rmap, unmap
+	 * of both file and anon pages, try to do compression async
+	 * if possible
+	 */
+	if (kcompressd_store(folio, handoff))
+		return SWAP_WRITEPAGE_HANDED;
+
 	if (zswap_store(folio)) {
 		count_mthp_stat(folio_order(folio), MTHP_STAT_ZSWPOUT);
 		goto out_unlock;
@@ -254,6 +401,84 @@ out_unlock:
 	folio_unlock(folio);
 	return ret;
 }
+
+int swap_writeout(struct swap_io_ctx *ctx, struct folio *folio)
+{
+	return __swap_writeout(ctx, folio, false);
+}
+
+int swap_writeout_handoff(struct swap_io_ctx *ctx, struct folio *folio)
+{
+	return __swap_writeout(ctx, folio, true);
+}
+
+#ifdef CONFIG_LRU_CAST
+/*
+ * Batch-drain size for kcompressd(): reuses the existing |vm_kcompressd|
+ * queue-depth knob (no separate batch-size knob) clamped to a sane range
+ * for the stack-allocated drain array.
+ */
+static inline unsigned int kcompressd_drain_depth(void)
+{
+	int d = abs(READ_ONCE(vm_kcompressd));
+
+	if (d < 1)
+		return 1;
+	if (d > SWAP_CLUSTER_MAX)
+		return SWAP_CLUSTER_MAX;
+	return d;
+}
+
+/*
+ * kcompressd() - Kernel thread for compressing folios
+ * @p: Pointer to pg_data_t structure
+ *
+ * This function runs in a kernel thread and waits for folios to be
+ * queued for compression. It drains its fifo in batches and dispatches
+ * each batch through do_swapout_batch(), and then finishes their reclaim,
+ * which kswapd handed over with them.
+ */
+int kcompressd(void *p)
+{
+	pg_data_t *pgdat = (pg_data_t *)p;
+	struct folio *batch[SWAP_CLUSTER_MAX];
+	LIST_HEAD(written);
+	unsigned int i, n;
+
+	/* * kcompressd runs with PF_MEMALLOC and PF_KSWAPD flags set to
+	 * allow it to allocate memory for compression without being
+	 * restricted by the current memory allocation context.
+	 * Also PF_KSWAPD prevents Intel Graphics driver from crashing
+	 * the system in i915_gem_shrinker.c:i915_gem_shrinker_scan()
+	 */
+	current->flags |= PF_MEMALLOC | PF_KSWAPD;
+
+	/* stopped after kswapd: what it handed over is seen to first */
+	for (;;) {
+		wait_event_interruptible(pgdat->kcompressd_wait,
+				!kfifo_is_empty(&pgdat->kcompressd_fifo) ||
+				kthread_should_stop());
+
+		for (;;) {
+			n = kfifo_out_locked(&pgdat->kcompressd_fifo,
+				batch,
+				kcompressd_drain_depth() * sizeof(*batch),
+				&pgdat->kcompressd_fifo_lock)
+					/ sizeof(*batch);
+			if (!n)
+				break;
+			do_swapout_batch(batch, n);
+			/* kswapd's reclaim of them, finished: written, they go now */
+			for (i = 0; i < n; i++)
+				list_add_tail(&batch[i]->lru, &written);
+			kcompressd_reclaim(&written, pgdat);
+		}
+		if (kthread_should_stop())
+			break;
+	}
+	return 0;
+}
+#endif /* CONFIG_LRU_CAST */
 
 #if defined(CONFIG_MEMCG) && defined(CONFIG_BLK_CGROUP)
 static struct cgroup_subsys_state *folio_memcg_blkg_css(struct folio *folio)
@@ -329,6 +554,18 @@ static bool swap_can_merge(struct swap_io_ctx *ctx, struct folio *folio,
 	return sis->ops->can_merge(folio, prev_folio, prev_folio_size, rw);
 }
 
+#ifdef CONFIG_LRU_CAST
+static inline bool swap_io_ctx_defer_sync(const struct swap_io_ctx *ctx)
+{
+	return ctx->defer_sync_submit;
+}
+#else
+static inline bool swap_io_ctx_defer_sync(const struct swap_io_ctx *ctx)
+{
+	return false;
+}
+#endif
+
 static void swap_add_folio(struct swap_io_ctx *ctx, struct folio *folio, int rw)
 {
 	struct swap_info_struct *sis = __swap_entry_to_info(folio->swap);
@@ -359,7 +596,8 @@ static void swap_add_folio(struct swap_io_ctx *ctx, struct folio *folio, int rw)
 	 * reclaim path beneficial.
 	 */
 	if (++sio->nr_bvecs == ARRAY_SIZE(sio->bvecs) ||
-	    (rw == WRITE && (sis->flags & SWP_SYNCHRONOUS_IO))) {
+	    (rw == WRITE && (sis->flags & SWP_SYNCHRONOUS_IO) &&
+	     !swap_io_ctx_defer_sync(ctx))) {
 		if (rw == WRITE)
 			swap_write_submit(ctx);
 		else

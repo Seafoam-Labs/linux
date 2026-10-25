@@ -20,6 +20,7 @@
 #include <linux/init.h>
 #include <linux/export.h>
 #include <linux/mm_inline.h>
+#include <linux/lru_cast.h>
 #include <linux/percpu_counter.h>
 #include <linux/memremap.h>
 #include <linux/percpu.h>
@@ -424,6 +425,16 @@ void folio_mark_accessed(struct folio *folio)
 {
 	if (folio_test_dropbehind(folio))
 		return;
+
+	if (lru_cast_enabled()) {
+		/* a read: recorded in the folio's state word, nothing moves */
+		if (!folio_test_unevictable(folio))
+			lru_cast_access_seen(folio, folio_test_clear_referenced(folio));
+		if (folio_test_idle(folio))
+			folio_clear_idle(folio);
+		return;
+	}
+
 	if (lru_gen_enabled()) {
 		lru_gen_inc_refs(folio);
 		return;
@@ -485,6 +496,10 @@ void folio_add_lru(struct folio *folio)
 		else if (!folio_test_referenced(folio))
 			folio_mark_accessed(folio);
 	}
+
+	/* CAST: a folio new to the cache, its entry is its read */
+	if (lru_cast_enabled())
+		lru_cast_enter(folio);
 
 	folio_batch_add_and_move(folio, lru_add);
 }
@@ -1152,6 +1167,8 @@ void lru_reparent_memcg(struct mem_cgroup *memcg, struct mem_cgroup *parent, int
 
 	child_lruvec = mem_cgroup_lruvec(memcg, NODE_DATA(nid));
 	parent_lruvec = mem_cgroup_lruvec(parent, NODE_DATA(nid));
+	/* CAST: the folios of M carry their lruvec's number in their tags */
+	lru_cast_reparent(child_lruvec, parent_lruvec);
 
 	for_each_lru(lru)
 		lruvec_reparent_lru(child_lruvec, parent_lruvec, lru, nid);

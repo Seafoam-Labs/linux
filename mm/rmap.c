@@ -986,6 +986,9 @@ static bool folio_referenced_one(struct folio *folio,
 		if (lru_gen_enabled() && !lru_gen_switching() && pvmw.pte) {
 			if (lru_gen_look_around(&pvmw, nr))
 				referenced++;
+		} else if (lru_cast_enabled() && pvmw.pte) {
+			if (lru_cast_look_around(&pvmw))
+				referenced++;
 		} else if (pvmw.pte) {
 			if (clear_flush_young_ptes_notify(vma, address, pvmw.pte, nr))
 				referenced++;

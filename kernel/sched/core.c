@@ -5515,6 +5515,7 @@ context_switch(struct rq *rq, struct task_struct *prev,
 		 */
 		switch_mm_irqs_off(prev->active_mm, next->mm, next);
 		lru_gen_use_mm(next->mm);
+		lru_cast_use_mm(next->mm);
 
 		if (!prev->mm) {			// from kernel
 			/* will mmdrop_lazy_tlb() in finish_task_switch(). */
@@ -5803,6 +5804,8 @@ void sched_tick(void)
 	donor = rq->donor;
 
 	psi_account_irqtime(rq, curr, NULL);
+	/* a task that runs on without switching still sets young bits */
+	lru_cast_use_mm(curr->mm);
 
 	update_rq_clock(rq);
 	hw_pressure = arch_scale_hw_pressure(cpu_of(rq));
