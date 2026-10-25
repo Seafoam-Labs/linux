@@ -39,7 +39,6 @@
 #include <linux/kthread.h>
 #include <linux/freezer.h>
 #include <linux/memcontrol.h>
-#include <linux/lru_marie.h>
 #include <linux/migrate.h>
 #include <linux/delayacct.h>
 #include <linux/sysctl.h>
@@ -149,6 +148,9 @@ struct scan_control {
 	/* The file folios on the current node are dangerously low */
 	unsigned int file_is_tiny:1;
 
+	/* CAST: the node's clean file is at the clean-file floor */
+	unsigned int clean_below_min:1;
+
 	/* Always discard instead of demoting to lower tier memory */
 	unsigned int no_demotion:1;
 
@@ -181,55 +183,6 @@ struct scan_control {
 	/* for recording the reclaimed slab by now */
 	struct reclaim_state reclaim_state;
 };
-
-/*
- * Accessors for out-of-tree reclaim readers (mm/lru_marie). Declared
- * in mm/internal.h with the struct kept private here. Trivial
- * field reads + one helper for the "target reached" comparison and
- * one for the reclaimed-count update. EXPORT_SYMBOL_GPL is
- * unnecessary -- Marie is built into vmlinux when CONFIG_LRU_MARIE
- * is on, never a module.
- */
-int sc_priority(const struct scan_control *sc)
-{
-	return sc->priority;
-}
-
-int sc_reclaim_idx(const struct scan_control *sc)
-{
-	return sc->reclaim_idx;
-}
-
-bool sc_reclaim_target_reached(const struct scan_control *sc)
-{
-	return sc->nr_reclaimed >= sc->nr_to_reclaim;
-}
-
-/*
- * The two halves of "did this pass take more than it was asked for". Exposed
- * for mm/lru_marie's budget accounting: nr_to_reclaim is the caller's target
- * for the whole node walk and nr_reclaimed is what the walk has banked so far,
- * so the outstanding NEED at any entry is the difference, not the target.
- */
-unsigned long sc_nr_to_reclaim(const struct scan_control *sc)
-{
-	return sc->nr_to_reclaim;
-}
-
-unsigned long sc_nr_reclaimed(const struct scan_control *sc)
-{
-	return sc->nr_reclaimed;
-}
-
-void sc_add_reclaimed(struct scan_control *sc, unsigned long nr)
-{
-	sc->nr_reclaimed += nr;
-}
-
-gfp_t sc_gfp_mask(const struct scan_control *sc)
-{
-	return sc->gfp_mask;
-}
 
 #ifdef ARCH_HAS_PREFETCHW
 #define prefetchw_prev_lru_folio(_folio, _base, _field)			\
@@ -417,74 +370,6 @@ static inline bool can_reclaim_anon_pages(struct mem_cgroup *memcg,
 	return can_demote(nid, sc, memcg);
 }
 
-#if defined(CONFIG_LRU_MARIE) && IS_ENABLED(CONFIG_ZSMALLOC)
-/*
- * marie_net_reclaimable_anon - discount anon by what reclaiming it will cost.
- *
- * "Anon is reclaimable" assumes evicting a page hands the page back. That
- * holds for a storage-backed swap device, where storing costs no RAM. It is
- * false for a RAM-backed one (zram/zswap): evicting a page frees it but
- * immediately consumes 1/r of a page storing the compressed result, so the
- * caller only really gets (1 - 1/r) back.
- *
- * Reported gross, that overstatement is unbounded in consequence rather than
- * merely inaccurate. should_reclaim_retry() decides whether to keep trying by
- * asking "if every reclaimable page were reclaimed, could any target zone
- * reach its watermark?" -- a threshold-free, exact criterion that is the
- * kernel's own definition of hopeless. Feed it a gross anon figure on a zram
- * machine sized far above RAM and the answer is always yes: nominal swap
- * slots never run out, so anon always looks reclaimable, the arithmetic
- * always says a watermark is reachable, no_progress_loops keeps resetting,
- * and the OOM killer never runs while every reclaim pass nets nothing. That
- * is the RAM-filled-with-zspages freeze. With a small zram the device's own
- * capacity runs out first and vanilla handles it unaided; the gap is
- * specifically the oversized-zram configuration distros ship.
- *
- * r is measured, not assumed: the store holds @stored pages of original data
- * in @zs pages of RAM, both of which the kernel already counts, so
- *
- *	net = anon * (1 - zs/stored)
- *
- * and no ratio, fraction of RAM, or tuning constant appears anywhere. The
- * figure reaches zero exactly when the store has stopped compressing
- * (zs >= stored), which is when evicting anon genuinely cannot return
- * anything. Robustness comes from r being the quotient of two large
- * cumulative counters: a transient allocation spike moves @anon but barely
- * moves the discount, so unlike a free-memory or headroom snapshot this
- * cannot be tipped by momentary noise.
- *
- * Gated on lru_marie_enabled() so MGLRU and legacy-LRU builds keep vanilla
- * arithmetic exactly, and this does not perturb baseline comparisons.
- */
-static unsigned long marie_net_reclaimable_anon(unsigned long anon)
-{
-	unsigned long zs, stored;
-	long used;
-
-	if (!lru_marie_enabled())
-		return anon;
-
-	zs = global_zone_page_state(NR_ZSPAGES);
-	if (!zs)
-		return anon;		/* nothing compressed: storage-backed */
-
-	used = total_swap_pages - get_nr_swap_pages();
-	if (used <= 0)
-		return anon;
-	stored = (unsigned long)used;
-
-	if (stored <= zs)
-		return 0;		/* store no longer compresses at all */
-
-	return mult_frac(anon, stored - zs, stored);
-}
-#else
-static inline unsigned long marie_net_reclaimable_anon(unsigned long anon)
-{
-	return anon;
-}
-#endif
-
 /*
  * This misses isolated folios which are not accounted for to save counters.
  * As the data only determines if reclaim or compaction continues, it is
@@ -496,28 +381,24 @@ unsigned long zone_reclaimable_pages(struct zone *zone)
 
 	nr = zone_page_state_snapshot(zone, NR_ZONE_INACTIVE_FILE) +
 		zone_page_state_snapshot(zone, NR_ZONE_ACTIVE_FILE);
-#ifdef CONFIG_LRU_MARIE
 	/*
-	 * File the clean_min_ratio floor protects is not reclaimable: no Marie
-	 * path will take it. Counted anyway, it has should_reclaim_retry()
-	 * judge a node with nothing left to reclaim as recoverable and delays
-	 * the OOM the floor is meant to lead to. The floor is node-wide; charge
-	 * each zone its share in proportion to the file it holds.
+	 * CAST: file under the clean-file floor is not reclaimable, no
+	 * global reclaim takes it; counted in, should_reclaim_retry() would
+	 * keep retrying a node with nothing left it may take. The floor is
+	 * node-wide; each zone is charged its share by the file it holds.
 	 */
-	if (lru_marie_enabled() && nr) {
+	if (lru_cast_enabled() && nr) {
 		struct pglist_data *pgdat = zone->zone_pgdat;
 		unsigned long node_file = node_page_state(pgdat, NR_ACTIVE_FILE) +
 					  node_page_state(pgdat, NR_INACTIVE_FILE);
-		unsigned long floor = lru_marie_floor_file_pages(pgdat);
+		unsigned long floor = lru_cast_floor_file_pages(pgdat);
 
 		if (floor && node_file)
 			nr -= min(nr, mult_frac(nr, min(floor, node_file), node_file));
 	}
-#endif
 	if (can_reclaim_anon_pages(NULL, zone_to_nid(zone), NULL))
-		nr += marie_net_reclaimable_anon(
-			zone_page_state_snapshot(zone, NR_ZONE_INACTIVE_ANON) +
-			zone_page_state_snapshot(zone, NR_ZONE_ACTIVE_ANON));
+		nr += zone_page_state_snapshot(zone, NR_ZONE_INACTIVE_ANON) +
+			zone_page_state_snapshot(zone, NR_ZONE_ACTIVE_ANON);
 
 	return nr;
 }
@@ -596,44 +477,6 @@ static int reclaimer_offset(struct scan_control *sc)
 	return PGSTEAL_DIRECT - PGSTEAL_KSWAPD;
 }
 
-#ifdef CONFIG_LRU_MARIE
-/*
- * Wrapper used by mm/lru_marie, which sees @sc but not the static
- * reclaimer_offset() above. On 6.18+/7.x reclaimer_offset() takes @sc, so
- * forward it.
- */
-int vmscan_reclaimer_offset(struct scan_control *sc)
-{
-	return reclaimer_offset(sc);
-}
-
-/*
- * cgroup_reclaim() is static above and struct scan_control is private
- * to vmscan.c. Marie needs the same predicate to gate its PGSCAN_* /
- * PGSTEAL_* event accounting (cgroup-scoped reclaim must not bump the
- * global vm events). Expose it as an sc_* accessor matching the
- * pattern already used for sc_priority / sc_reclaim_idx etc.
- */
-bool sc_cgroup_reclaim(const struct scan_control *sc)
-{
-	return cgroup_reclaim((struct scan_control *)sc);
-}
-
-/*
- * can_reclaim_anon_pages() is static above. Marie's pick driver needs
- * the same predicate: when anon cannot be reclaimed at all (no free
- * swap slots, cgroup swap limit hit, no demotion target) the
- * swappiness/bias controller is meaningless -- every ANON pick
- * reclaims nothing -- so Marie must force FILE reclaim, mirroring
- * get_scan_count()'s "!can_reclaim_anon_pages -> SCAN_FILE" forcing.
- * Expose it as a vmscan_* wrapper; struct scan_control stays private.
- */
-bool vmscan_can_reclaim_anon_pages(struct mem_cgroup *memcg, int nid,
-				   struct scan_control *sc)
-{
-	return can_reclaim_anon_pages(memcg, nid, sc);
-}
-#endif
 /*
  * We detected a synchronous write error writing a folio out.  Probably
  * -ENOSPC.  We need to propagate that into the address_space for a subsequent
@@ -788,6 +631,8 @@ typedef enum {
 	PAGE_SUCCESS,
 	/* folio is clean and locked */
 	PAGE_CLEAN,
+	/* folio is kcompressd's, to write and reclaim (SWAP_WRITEPAGE_HANDED) */
+	PAGE_HANDED,
 } pageout_t;
 
 /*
@@ -832,8 +677,15 @@ static pageout_t pageout(struct swap_io_ctx *ctx, struct address_space *mapping,
 	if (shmem_mapping(mapping))
 		res = shmem_writeout(ctx, folio, folio_list);
 	else
-		res = swap_writeout(ctx, folio);
+		res = swap_writeout_handoff(ctx, folio);
 
+#if defined(CONFIG_LRU_CAST) && defined(CONFIG_SWAP)
+	if (res == SWAP_WRITEPAGE_HANDED) {
+		folio_clear_reclaim(folio);
+		lruvec_stat_mod_folio(folio, NR_VMSCAN_WRITE, folio_nr_pages(folio));
+		return PAGE_HANDED;
+	}
+#endif
 	if (res < 0)
 		handle_write_error(mapping, folio, res);
 	if (res == AOP_WRITEPAGE_ACTIVATE) {
@@ -1057,7 +909,10 @@ static enum folio_references folio_check_references(struct folio *folio,
 		return FOLIOREF_ACTIVATE;
 
 	/*
-	 * Legacy/MGLRU rmap contention: rotate.
+	 * There are two cases to consider.
+	 * 1) Rmap lock contention: rotate.
+	 * 2) Skip the non-shared swapbacked folio mapped solely by
+	 *    the exiting or OOM-reaped process.
 	 */
 	if (referenced_ptes == -1)
 		return FOLIOREF_KEEP;
@@ -1071,48 +926,38 @@ static enum folio_references folio_check_references(struct folio *folio,
 
 	referenced_folio = folio_test_clear_referenced(folio);
 
-#ifdef CONFIG_LRU_MARIE
-	if (lru_marie_enabled()) {
-		int hot_votes;
-
-		/*
-		 * Two votes now (referenced_ptes, referenced_folio): Marie's
-		 * former per-PFN tier vote is retired (see state.h's
-		 * byte-layout block) -- a folio promotes straight to the
-		 * head gen on any access instead of carrying an intermediate
-		 * hotness signal here to vote with.
-		 */
-		hot_votes = (referenced_ptes > 0) + !!referenced_folio;
-
-		if (hot_votes >= 2 || referenced_ptes > 1)
-			return FOLIOREF_ACTIVATE;
-
-		/*
-		 * 7.3: folio_referenced() reports VMA flags through the typed
-		 * vma_flags_t instead of an unsigned long, and vmscan wraps the
-		 * exec-file test in is_exec_file_folio() -- identical predicate
-		 * to the former "(vm_flags & VM_EXEC) && folio_is_file_lru()".
-		 */
-		if (referenced_ptes > 0 && is_exec_file_folio(folio, &vma_flags))
-			return FOLIOREF_ACTIVATE;
-
-		/*
-		 * 7.3 deleted FOLIOREF_RECLAIM_CLEAN together with the stock
-		 * "reclaim if clean, defer dirty folios to writeback" case that
-		 * produced it; upstream now returns plain FOLIOREF_RECLAIM for
-		 * exactly this class of folio (referenced-once file), and
-		 * shrink_folio_list() has lost the matching keep_locked arm.
-		 * Follow upstream rather than resurrecting the enum value.
-		 */
-		if (hot_votes == 1 && referenced_folio && folio_is_file_lru(folio))
-			return FOLIOREF_RECLAIM;
-
-		if (hot_votes >= 1)
-			return FOLIOREF_KEEP;
-
-		return FOLIOREF_RECLAIM;
+	/*
+	 * CAST: the folio goes if its key still puts it at or below the
+	 * bucket reclaim takes from; above, it goes back to M under its key.
+	 * The key is all there is to ask: a read reaches it by whatever way
+	 * it was seen -- a read(), a fault, the walker's young bits, or a
+	 * young pte found now, a read the folio had not been credited with
+	 * and counted here -- and the folio's place in the ring may be older
+	 * than its last read. Executable file text in use stays whatever its
+	 * key, from the first use seen, as legacy reclaim keeps it: it is
+	 * small, and a program's code evicted is one stalled. Its read is
+	 * counted as the most a word holds (lru_cast_access_kept()), which
+	 * puts it at the top of the ring.
+	 *
+	 * The first young pte after the folio came in may be no more than the
+	 * fault that brought it -- counted already as its entry -- or that and
+	 * more: the bit cannot tell. As legacy does with a folio referenced
+	 * once, it is given another round instead (the mark cleared, it goes
+	 * round its bucket once, behind its equals), and the next young pte is
+	 * counted.
+	 */
+	if (lru_cast_enabled() && lru_cast_folio_on(folio)) {
+		if (referenced_ptes) {
+			if (vma_flags_test(&vma_flags, VMA_EXEC_BIT) && folio_is_file_lru(folio)) {
+				lru_cast_access_kept(folio);
+				return FOLIOREF_ACTIVATE;
+			}
+			if (referenced_folio)
+				return FOLIOREF_ACTIVATE;
+			lru_cast_access_young(folio);
+		}
+		return lru_cast_still_victim(folio) ? FOLIOREF_RECLAIM : FOLIOREF_ACTIVATE;
 	}
-#endif
 
 	if (referenced_ptes) {
 		/*
@@ -1268,13 +1113,9 @@ static bool may_enter_fs(struct folio *folio, gfp_t gfp_mask)
 }
 
 /*
- * shrink_folio_list() returns the number of reclaimed pages.
- *
- * Exposed via mm/internal.h so that mm/lru_marie.c can drive its own
- * isolate→shrink→putback loop without duplicating the per-folio
- * reclaim machinery.
+ * shrink_folio_list() returns the number of reclaimed pages
  */
-unsigned int shrink_folio_list(struct list_head *folio_list,
+static unsigned int shrink_folio_list(struct list_head *folio_list,
 		struct pglist_data *pgdat, struct scan_control *sc,
 		struct reclaim_stat *stat, bool ignore_references,
 		struct mem_cgroup *memcg)
@@ -1627,6 +1468,14 @@ retry:
 					nr_pages = 1;
 				}
 				goto activate_locked;
+			case PAGE_HANDED:
+				/*
+				 * kcompressd writes it and frees it, in a
+				 * moment: counted as freed, or kswapd would
+				 * write more in the meantime
+				 */
+				nr_reclaimed += nr_pages;
+				continue;
 			case PAGE_SUCCESS:
 				if (nr_pages > 1 && !folio_test_large(folio)) {
 					sc->nr_scanned -= (nr_pages - 1);
@@ -1989,6 +1838,53 @@ move:
 	return nr_taken;
 }
 
+#ifdef CONFIG_LRU_CAST
+/*
+ * CAST's victims (mm/lru_cast/reclaim.c): the inactive list is the
+ * newcomers' FIFO window W, the active part M a ring of buckets by key.
+ * CAST picks; the accounting stays here.
+ */
+static unsigned long lru_cast_isolate_folios(unsigned long nr_to_scan,
+		struct lruvec *lruvec, struct list_head *dst,
+		unsigned long *nr_scanned, struct scan_control *sc, int type)
+{
+	enum lru_list lru_w = type ? LRU_INACTIVE_FILE : LRU_INACTIVE_ANON;
+	enum lru_list lru_m = lru_w + LRU_ACTIVE;
+	struct lru_cast_scan s = {
+		.type = type,
+		.reclaim_idx = sc->reclaim_idx,
+		.may_unmap = sc->may_unmap,
+		.nr_to_scan = nr_to_scan,
+		.nr_w = lruvec_lru_size(lruvec, lru_w, MAX_NR_ZONES),
+		.nr_m = lruvec_lru_size(lruvec, lru_m, MAX_NR_ZONES),
+	};
+	unsigned long skipped = 0;
+	int zid;
+
+	lru_cast_isolate(lruvec, &s, dst);
+
+	for (zid = 0; zid < MAX_NR_ZONES; zid++) {
+		if (!s.skipped[zid])
+			continue;
+		__count_zid_vm_events(PGSCAN_SKIP, zid, s.skipped[zid]);
+		skipped += s.skipped[zid];
+	}
+	*nr_scanned = s.nr_scanned;
+	trace_mm_vmscan_lru_isolate(sc->reclaim_idx, sc->order, nr_to_scan,
+				    s.nr_scanned, skipped, s.nr_taken, lru_w);
+	update_lru_sizes(lruvec, lru_w, s.taken_w);
+	update_lru_sizes(lruvec, lru_m, s.taken_m);
+	return s.nr_taken;
+}
+#else
+static unsigned long lru_cast_isolate_folios(unsigned long nr_to_scan,
+		struct lruvec *lruvec, struct list_head *dst,
+		unsigned long *nr_scanned, struct scan_control *sc, int type)
+{
+	return 0;
+}
+#endif /* CONFIG_LRU_CAST */
+
 /**
  * folio_isolate_lru() - Try to isolate a folio from its LRU list.
  * @folio: Folio to isolate from its LRU list.
@@ -2129,29 +2025,7 @@ static unsigned int move_folios_to_lru(struct list_head *list)
 			continue;
 		}
 
-#ifdef CONFIG_LRU_MARIE
-		/*
-		 * Legacy reclaim putback. Under Marie this is reached for the
-		 * untracked orphans that legacy shrink_{in,}active_list isolates
-		 * off legacy lists (e.g. workingset-refault activations routed
-		 * through folio_activate). Routing their re-add through
-		 * lruvec_add_folio() -> lru_marie_add_folio() would ADOPT them
-		 * into Marie -- the exact adopt asymmetry fixed for swap.c's
-		 * move_fns. Mirror that fix here: a tracked folio must never
-		 * have been on a legacy list (WARN; hand it back to Marie, whose
-		 * install early-out re-asserts ownership), and an untracked
-		 * orphan gets a pure non-adopting legacy add.
-		 */
-		if (lru_marie_enabled()) {
-			if (unlikely(lru_marie_test_tracked(folio))) {
-				VM_WARN_ON_ONCE_FOLIO(1, folio);
-				lruvec_add_folio(lruvec, folio);
-			} else {
-				lru_marie_orphan_add(lruvec, folio, false);
-			}
-		} else
-#endif
-			lruvec_add_folio(lruvec, folio);
+		lruvec_add_folio(lruvec, folio);
 		nr_pages = folio_nr_pages(folio);
 		nr_moved += nr_pages;
 		if (folio_test_active(folio))
@@ -2252,8 +2126,12 @@ static unsigned long shrink_inactive_list(unsigned long nr_to_scan,
 
 	lruvec_lock_irq(lruvec);
 
-	nr_taken = isolate_lru_folios(nr_to_scan, lruvec, &folio_list,
-				     &nr_scanned, sc, lru);
+	if (lru_cast_on(lruvec))
+		nr_taken = lru_cast_isolate_folios(nr_to_scan, lruvec, &folio_list,
+						    &nr_scanned, sc, file);
+	else
+		nr_taken = isolate_lru_folios(nr_to_scan, lruvec, &folio_list,
+					      &nr_scanned, sc, lru);
 
 	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, nr_taken);
 	item = PGSCAN_KSWAPD + reclaimer_offset(sc);
@@ -2417,6 +2295,33 @@ static unsigned int reclaim_folio_list(struct list_head *folio_list,
 	return nr_reclaimed;
 }
 
+#if defined(CONFIG_LRU_CAST) && defined(CONFIG_SWAP)
+/*
+ * kcompressd (mm/page_io.c): the folios kswapd handed it, written now,
+ * through the rest of reclaim as kswapd would have taken them -- a folio
+ * read since is kept -- and what is not freed back to the LRU
+ */
+void kcompressd_reclaim(struct list_head *folio_list, struct pglist_data *pgdat)
+{
+	struct reclaim_stat stat;
+	struct folio *folio;
+	struct scan_control sc = {
+		.gfp_mask = GFP_KERNEL,
+		.may_writepage = 1,
+		.may_unmap = 1,
+		.may_swap = 1,
+		.no_demotion = 1,
+	};
+
+	shrink_folio_list(folio_list, pgdat, &sc, &stat, false, NULL);
+	while (!list_empty(folio_list)) {
+		folio = lru_to_folio(folio_list);
+		list_del(&folio->lru);
+		folio_putback_lru(folio);
+	}
+}
+#endif
+
 unsigned long reclaim_pages(struct list_head *folio_list)
 {
 	int nid;
@@ -2453,6 +2358,11 @@ unsigned long reclaim_pages(struct list_head *folio_list)
 static unsigned long shrink_list(enum lru_list lru, unsigned long nr_to_scan,
 				 struct lruvec *lruvec, struct scan_control *sc)
 {
+	/* CAST: either list's share of the scan picks from both parts */
+	if (lru_cast_on(lruvec))
+		return shrink_inactive_list(nr_to_scan, lruvec, sc,
+					    is_file_lru(lru) ? LRU_INACTIVE_FILE : LRU_INACTIVE_ANON);
+
 	if (is_active_lru(lru)) {
 		if (sc->may_deactivate & (1 << is_file_lru(lru)))
 			shrink_active_list(nr_to_scan, lruvec, sc, lru);
@@ -2680,6 +2590,14 @@ static void prepare_scan_control(pg_data_t *pgdat, struct scan_control *sc)
 			!(sc->may_deactivate & DEACTIVATE_ANON) &&
 			anon >> sc->priority;
 	}
+
+	/*
+	 * CAST's clean-file floor holds for all reclaim but that of a
+	 * cgroup at its limit (mm/lru_cast/balance.c).
+	 */
+	sc->clean_below_min = lru_cast_on(target_lruvec) &&
+			      !(cgroup_reclaim(sc) && !sc->proactive) &&
+			      lru_cast_floor_holds(pgdat);
 }
 
 static inline void calculate_pressure_balance(struct scan_control *sc,
@@ -2816,6 +2734,34 @@ static void get_scan_count(struct lruvec *lruvec, struct scan_control *sc,
 		goto out;
 	}
 
+	/*
+	 * CAST takes from the type over its share of memory, the share
+	 * that loses least by the types' measured miss-ratio curves and what
+	 * their refaults cost; both by size while it is still learning them
+	 * (mm/lru_cast/balance.c). File under the clean-file floor is not on
+	 * offer.
+	 */
+	if (lru_cast_on(lruvec)) {
+		switch (lru_cast_pick(lruvec, swappiness, sc->priority,
+				       sc->may_swap &&
+				       can_reclaim_anon_pages(memcg, pgdat->node_id, sc),
+				       !sc->clean_below_min)) {
+		case LRU_CAST_ANON:
+			scan_balance = SCAN_ANON;
+			goto out;
+		case LRU_CAST_FILE:
+			scan_balance = SCAN_FILE;
+			goto out;
+		case LRU_CAST_EQUAL:
+			scan_balance = SCAN_EQUAL;
+			goto out;
+		default:
+			for_each_evictable_lru(lru)
+				nr[lru] = 0;
+			return;
+		}
+	}
+
 	/* If we have no swap space, do not bother scanning anon folios. */
 	if (!sc->may_swap || !can_reclaim_anon_pages(memcg, pgdat->node_id, sc)) {
 		scan_balance = SCAN_FILE;
@@ -2881,6 +2827,10 @@ out:
 		 */
 		if (!scan && !mem_cgroup_online(memcg))
 			scan = min(lruvec_size, SWAP_CLUSTER_MAX);
+
+		/* CAST: no file below the floor, whatever decided it */
+		if (file && sc->clean_below_min)
+			scan = 0;
 
 		switch (scan_balance) {
 		case SCAN_EQUAL:
@@ -5596,55 +5546,6 @@ static bool drain_evictable(struct lruvec *lruvec)
 	return true;
 }
 
-/*
- * lru_gen_fill_lruvec - hand off legacy LRU residue to MGLRU.
- *
- * Move every folio currently on lruvec->lists[lru] into lrugen via
- * the canonical lru_gen_add_folio path. Symmetric counterpart to
- * lru_gen_drain_lruvec below; exported so external LRU drivers
- * (mm/lru_marie) can call it after their own drain pass to keep
- * MGLRU's state_is_valid invariant ("lrugen enabled => legacy
- * lists empty") intact across enable/disable cycles of the other
- * driver.
- *
- * Caller must hold @lruvec->lru_lock with IRQs disabled. The
- * helper internally releases and reacquires across the cond_resched
- * between MAX_LRU_BATCH-sized passes, matching the locking pattern
- * lru_gen_change_state itself uses.
- */
-void lru_gen_fill_lruvec(struct lruvec *lruvec)
-{
-	while (!fill_evictable(lruvec)) {
-		spin_unlock_irq(&lruvec->lru_lock);
-		cond_resched();
-		spin_lock_irq(&lruvec->lru_lock);
-	}
-}
-EXPORT_SYMBOL_GPL(lru_gen_fill_lruvec);
-
-/*
- * lru_gen_drain_lruvec - evacuate lrugen via the canonical add path.
- *
- * Inverse of lru_gen_fill_lruvec: empty lrugen by removing every
- * folio via lru_gen_del_folio and re-adding via lruvec_add_folio.
- * With another LRU driver's gate on (e.g. Marie), the re-add routes
- * through that driver's install path -- which both saves Marie from
- * reimplementing MGLRU's accounting and gives the folio Marie's
- * canonical per-PFN install for free. With no other driver active
- * the folios fall through to lruvec->lists[lru].
- *
- * Caller must hold @lruvec->lru_lock with IRQs disabled.
- */
-void lru_gen_drain_lruvec(struct lruvec *lruvec)
-{
-	while (!drain_evictable(lruvec)) {
-		spin_unlock_irq(&lruvec->lru_lock);
-		cond_resched();
-		spin_lock_irq(&lruvec->lru_lock);
-	}
-}
-EXPORT_SYMBOL_GPL(lru_gen_drain_lruvec);
-
 static void lru_gen_change_state(bool enabled)
 {
 	static DEFINE_MUTEX(state_mutex);
@@ -6166,15 +6067,7 @@ void lru_gen_init_lruvec(struct lruvec *lruvec)
 	struct lru_gen_mm_state *mm_state = get_mm_state(lruvec);
 
 	lrugen->max_seq = MIN_NR_GENS + 1;
-	/*
-	 * lrugen->enabled mirrors the raw MGLRU core key, not the
-	 * Marie-masked lru_gen_enabled() view: it must stay true when MGLRU
-	 * is configured-on even while Marie masks MGLRU off, so the
-	 * Marie-disable ownership handoff (lru_gen_fill_lruvec ->
-	 * fill_evictable -> lru_gen_add_folio, which bails on !lrugen->enabled)
-	 * can migrate folios back onto lrugen.
-	 */
-	lrugen->enabled = lru_gen_core_enabled();
+	lrugen->enabled = lru_gen_enabled();
 
 	for (i = 0; i <= MIN_NR_GENS + 1; i++)
 		lrugen->timestamps[i] = jiffies;
@@ -6274,23 +6167,7 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
 	unsigned long nr_to_reclaim = sc->nr_to_reclaim;
 	bool proportional_reclaim;
 	struct blk_plug plug;
-#ifdef CONFIG_LRU_MARIE
-	unsigned int marie_drain_mask = MARIE_DRAIN_ANON | MARIE_DRAIN_FILE;
-#endif
 
-#ifdef CONFIG_LRU_MARIE
-	if (lru_marie_enabled()) {
-		marie_drain_mask = lru_marie_shrink_lruvec(lruvec, sc);
-		/*
-		 * Fall through to the legacy reclaim path below to drain orphan
-		 * folios (failed Marie install) that landed on lruvec->lists;
-		 * MGLRU is bypassed under Marie. The drain is constrained by
-		 * marie_drain_mask below so it touches only the type(s) Marie
-		 * scanned. Common case: the lists are empty and this is a cheap
-		 * no-op.
-		 */
-	} else
-#endif
 	if ((lru_gen_enabled() || lru_gen_switching()) && !root_reclaim(sc)) {
 		lru_gen_shrink_lruvec(lruvec, sc);
 
@@ -6300,29 +6177,6 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
 	}
 
 	get_scan_count(lruvec, sc, nr);
-
-#ifdef CONFIG_LRU_MARIE
-	/*
-	 * Constrain the legacy orphan drain to the type(s) Marie's pick driver
-	 * actually scanned this call (marie_drain_mask). Stock get_scan_count's
-	 * policy (SCAN_EQUAL at sc->priority==0, SCAN_ANON on file_is_tiny)
-	 * ignores Marie's swappiness / clean_min_ratio / ANON_STRICT decisions
-	 * and would otherwise cut the protected type behind the driver's back
-	 * (e.g. evicting file at vm.swappiness=200, or swapping at swappiness=0).
-	 * Zero the nr[] of any type Marie did not scan. Marie-only; the
-	 * legacy/MGLRU nr[] is left byte-identical.
-	 */
-	if (lru_marie_enabled()) {
-		if (!(marie_drain_mask & MARIE_DRAIN_FILE)) {
-			nr[LRU_ACTIVE_FILE] = 0;
-			nr[LRU_INACTIVE_FILE] = 0;
-		}
-		if (!(marie_drain_mask & MARIE_DRAIN_ANON)) {
-			nr[LRU_ACTIVE_ANON] = 0;
-			nr[LRU_INACTIVE_ANON] = 0;
-		}
-	}
-#endif
 
 	/* Record the original scan target for proportional adjustments later */
 	memcpy(targets, nr, sizeof(nr));
@@ -6342,8 +6196,14 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
 				sc->priority == DEF_PRIORITY);
 
 	blk_start_plug(&plug);
+	/*
+	 * Active anon is aged after the loop, not reclaimed in it -- but for
+	 * CAST, which takes from M, the active part, as it is: with W
+	 * empty, as it is when W's share is 0, anon would be left unscanned.
+	 */
 	while (nr[LRU_INACTIVE_ANON] || nr[LRU_ACTIVE_FILE] ||
-					nr[LRU_INACTIVE_FILE]) {
+	       nr[LRU_INACTIVE_FILE] ||
+	       (lru_cast_on(lruvec) && nr[LRU_ACTIVE_ANON])) {
 		unsigned long nr_anon, nr_file, percentage;
 		unsigned long nr_scanned;
 
@@ -6416,9 +6276,10 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
 
 	/*
 	 * Even if we did not try to evict anon pages at all, we want to
-	 * rebalance the anon lru active/inactive ratio.
+	 * rebalance the anon lru active/inactive ratio. CAST has no
+	 * active list to age.
 	 */
-	if (can_age_anon_pages(lruvec, sc) &&
+	if (!lru_cast_on(lruvec) && can_age_anon_pages(lruvec, sc) &&
 	    inactive_is_low(lruvec, LRU_INACTIVE_ANON))
 		shrink_active_list(SWAP_CLUSTER_MAX, lruvec,
 				   sc, LRU_ACTIVE_ANON);
@@ -6579,32 +6440,14 @@ static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
 	struct lruvec *target_lruvec;
 	bool reclaimable = false;
 
-#ifdef CONFIG_LRU_MARIE
-	/*
-	 * MGLRU's root-reclaim shortcut bypasses shrink_node_memcgs entirely,
-	 * which is where shrink_lruvec — and therefore Marie — gets invoked.
-	 * When lru_marie_enabled() that bypass would leave kswapd walking empty
-	 * MGLRU gens (since folios live in Marie gens) and never touching Marie
-	 * at all.  Gate the shortcut on !lru_marie_enabled() so kswapd takes the
-	 * standard shrink_node_memcgs path under Marie.
-	 */
-	if (!lru_marie_enabled() &&
-	    (lru_gen_enabled() || lru_gen_switching()) && root_reclaim(sc)) {
-		memset(&sc->nr, 0, sizeof(sc->nr));
-		lru_gen_shrink_node(pgdat, sc);
-
-		if (!lru_gen_switching())
-			return;
-	}
-#else
 	if ((lru_gen_enabled() || lru_gen_switching()) && root_reclaim(sc)) {
 		memset(&sc->nr, 0, sizeof(sc->nr));
 		lru_gen_shrink_node(pgdat, sc);
 
 		if (!lru_gen_switching())
 			return;
+
 	}
-#endif
 
 	target_lruvec = mem_cgroup_lruvec(sc->target_mem_cgroup, pgdat);
 
@@ -6873,17 +6716,6 @@ static void snapshot_refaults(struct mem_cgroup *target_memcg, pg_data_t *pgdat)
 	struct lruvec *target_lruvec;
 	unsigned long refaults;
 
-#ifdef CONFIG_LRU_MARIE
-	/*
-	 * Marie has no equivalent of legacy refault tracking yet, and the
-	 * legacy WORKINGSET_* counters don't reflect Marie state — skip the
-	 * snapshot to avoid feeding MGLRU/legacy-tuned heuristics with stale
-	 * data.
-	 */
-	if (lru_marie_enabled())
-		return;
-#endif
-
 	if (lru_gen_enabled() && !lru_gen_switching())
 		return;
 
@@ -7007,17 +6839,16 @@ retry:
 	return 0;
 }
 
-/*
- * The watermark half of allow_direct_reclaim(), without its side effect of
- * waking kswapd, so kswapd itself can ask whether throttled direct reclaimers
- * would be released yet.
- */
-static bool pfmemalloc_wmark_ok(pg_data_t *pgdat)
+static bool allow_direct_reclaim(pg_data_t *pgdat)
 {
 	struct zone *zone;
 	unsigned long pfmemalloc_reserve = 0;
 	unsigned long free_pages = 0;
 	int i;
+	bool wmark_ok;
+
+	if (kswapd_test_hopeless(pgdat))
+		return true;
 
 	for_each_managed_zone_pgdat(zone, pgdat, i, ZONE_NORMAL) {
 		if (!zone_reclaimable_pages(zone) && zone_page_state_snapshot(zone, NR_FREE_PAGES))
@@ -7031,17 +6862,7 @@ static bool pfmemalloc_wmark_ok(pg_data_t *pgdat)
 	if (!pfmemalloc_reserve)
 		return true;
 
-	return free_pages > pfmemalloc_reserve / 2;
-}
-
-static bool allow_direct_reclaim(pg_data_t *pgdat)
-{
-	bool wmark_ok;
-
-	if (kswapd_test_hopeless(pgdat))
-		return true;
-
-	wmark_ok = pfmemalloc_wmark_ok(pgdat);
+	wmark_ok = free_pages > pfmemalloc_reserve / 2;
 
 	/* kswapd must be awake if processes are being throttled */
 	if (!wmark_ok && waitqueue_active(&pgdat->kswapd_wait)) {
@@ -7285,21 +7106,6 @@ static void kswapd_age_node(struct pglist_data *pgdat, struct scan_control *sc)
 	struct mem_cgroup *memcg;
 	struct lruvec *lruvec;
 
-#ifdef CONFIG_LRU_MARIE
-	/*
-	 * Marie: drive proactive aging from kswapd's pre-reclaim hook so the
-	 * gen ring has accurate hot/cold ordering by the time direct reclaim
-	 * picks the tail.  lru_marie_age_node() walks running tasks' PTEs
-	 * (rate-limited internally) and skips the legacy active-list
-	 * deactivation below — legacy lists only hold mempool-failure orphans
-	 * under Marie and aging them is not worthwhile.
-	 */
-	if (lru_marie_enabled()) {
-		lru_marie_age_node(pgdat, sc);
-		return;
-	}
-#endif
-
 	if (lru_gen_enabled() || lru_gen_switching()) {
 		lru_gen_age_node(pgdat, sc);
 
@@ -7307,6 +7113,10 @@ static void kswapd_age_node(struct pglist_data *pgdat, struct scan_control *sc)
 			return;
 
 	}
+
+	/* CAST has no active list to age: its order is the key */
+	if (lru_cast_enabled())
+		return;
 
 	lruvec = mem_cgroup_lruvec(NULL, pgdat);
 	if (!can_age_anon_pages(lruvec, sc))
@@ -7354,32 +7164,6 @@ static bool pgdat_watermark_boosted(pg_data_t *pgdat, int highest_zoneidx)
  */
 static bool pgdat_balanced(pg_data_t *pgdat, int order, int highest_zoneidx)
 {
-#ifdef CONFIG_LRU_MARIE
-	/*
-	 * Never call the node balanced while direct reclaimers are parked on
-	 * pfmemalloc_wait and the condition that releases them does not hold.
-	 *
-	 * The two checks measure different things. Balanced is "any zone up to
-	 * highest_zoneidx meets its high watermark"; allow_direct_reclaim() is
-	 * "summed free over the zones up to ZONE_NORMAL exceeds half their
-	 * summed min". Once one zone is drained far below min while another
-	 * sits above high -- which Marie's zone-blind, node-global reclaim
-	 * order can produce -- both hold at once: the throttled tasks wake
-	 * kswapd, kswapd finds the node balanced, reclaims nothing and wakes
-	 * them on its way to sleep, they re-check, still fail and wake kswapd
-	 * again. Nobody reclaims the drained zone and the box stops for good
-	 * (measured: DMA32 free 60 vs min 6171, Normal 3380 vs high 2982,
-	 * pgsteal flat for minutes, 5 GB of free swap).
-	 *
-	 * Treating that state as unbalanced makes kswapd reclaim until the
-	 * throttled tasks can go. If it cannot, kswapd_failures accrues as
-	 * usual and the node turns hopeless, which allow_direct_reclaim()
-	 * already lets through, so this cannot keep kswapd spinning.
-	 */
-	if (lru_marie_enabled() && waitqueue_active(&pgdat->pfmemalloc_wait) &&
-	    !pfmemalloc_wmark_ok(pgdat))
-		return false;
-#endif
 	int i;
 	unsigned long mark = -1;
 	struct zone *zone;
@@ -7443,55 +7227,6 @@ static bool pgdat_balanced(pg_data_t *pgdat, int order, int highest_zoneidx)
 
 	return false;
 }
-
-#ifdef CONFIG_LRU_MARIE_DEFRAG
-/*
- * Returns true if the high-order request kswapd was woken for is a
- * fragmentation problem rather than a shortage, i.e. compaction can already
- * work and reclaiming order-0 pages would not help it.
- *
- * Direct reclaim already asks this: shrink_zones() consults compaction_ready()
- * for orders above PAGE_ALLOC_COSTLY_ORDER and returns without reclaiming a
- * single page when the zone is already above high_wmark + compact_gap(order).
- * kswapd never goes through shrink_zones(), so it has never had that check --
- * it reclaims a full Sum(high_wmark) first and only afterwards does
- * kswapd_shrink_node() consult compact_gap() and abandon the order. The guard
- * that exists to "prevent excessive reclaim" therefore only ever stops the
- * SECOND pass.
- *
- * On a stock kernel that asymmetry is survivable because kcompactd keeps a
- * stock of high-order blocks, so the wake is rare. It stops being survivable
- * when Marie defrag has replaced kcompactd's scanners (mm/compaction.c, both
- * paths) and is not keeping that stock -- hence the gate at the caller.
- *
- * Measured on a 30 GiB desktop under sustained THP load, with ZONE_NORMAL
- * holding a single free order-9 block: 424 kswapd wakes, each reclaiming
- * exactly Sum(high_wmark) = 32809 pages = 128 MB, for 53 GB of page cache
- * destroyed in six hours chasing order-9 blocks that order-0 reclaim cannot
- * produce. Free memory climbed to 12 GB while the cache fell from 21 GB to
- * 3 GB and pgsteal_anon stayed flat at zero; nothing consumed what was freed.
- * compact_gap(9) is 1024 pages, so each wake spent 32x the threshold at which
- * the kernel itself declares the high-order goal hopeless.
- *
- * Any-zone semantics, matching pgdat_balanced() above.
- */
-static bool pgdat_compaction_ready(pg_data_t *pgdat, struct scan_control *sc)
-{
-	struct zone *zone;
-	int z;
-
-	for (z = 0; z <= sc->reclaim_idx; z++) {
-		zone = pgdat->node_zones + z;
-
-		if (!managed_zone(zone))
-			continue;
-		if (compaction_ready(zone, sc))
-			return true;
-	}
-
-	return false;
-}
-#endif /* CONFIG_LRU_MARIE_DEFRAG */
 
 /* Clear pgdat state for congested, dirty or under writeback. */
 static void clear_pgdat_congested(pg_data_t *pgdat)
@@ -7698,34 +7433,6 @@ restart:
 		 * re-evaluate if boosting is required when kswapd next wakes.
 		 */
 		balanced = pgdat_balanced(pgdat, sc.order, highest_zoneidx);
-
-#ifdef CONFIG_LRU_MARIE_DEFRAG
-		/*
-		 * A high-order wake on a node that already holds enough free
-		 * pages for compaction to run is a fragmentation problem, not
-		 * a shortage, and order-0 reclaim does not create order-N
-		 * blocks. Give the order to compaction instead of paying for
-		 * it in page cache -- kswapd_try_to_sleep() wakes kcompactd on
-		 * the way out, which is where this request belongs. The order
-		 * bound is the one shrink_zones() uses for the identical
-		 * decision in direct reclaim.
-		 *
-		 * Gated on lru_marie_defrag_active() so that everything else
-		 * keeps vanilla behaviour EXACTLY: a build without
-		 * CONFIG_LRU_MARIE_DEFRAG does not compile this, and
-		 * .../lru_marie/defrag=0 -- which puts kcompactd's stock
-		 * scanners back -- does not take it. That also keeps defrag=0
-		 * usable as a true stock control arm, which is how the
-		 * behaviour above was isolated in the first place.
-		 */
-		if (!balanced && sc.order > PAGE_ALLOC_COSTLY_ORDER &&
-		    lru_marie_defrag_active() &&
-		    pgdat_compaction_ready(pgdat, &sc)) {
-			sc.order = 0;
-			balanced = pgdat_balanced(pgdat, 0, highest_zoneidx);
-		}
-#endif
-
 		if (!balanced && nr_boost_reclaim) {
 			nr_boost_reclaim = 0;
 			goto restart;
@@ -8181,7 +7888,7 @@ unsigned long shrink_all_memory(unsigned long nr_to_reclaim)
 void __meminit kswapd_run(int nid)
 {
 	pg_data_t *pgdat = NODE_DATA(nid);
-#if defined(CONFIG_LRU_MARIE) && defined(CONFIG_SWAP)
+#if defined(CONFIG_LRU_CAST) && defined(CONFIG_SWAP)
 	int ret;
 #endif
 
@@ -8197,7 +7904,7 @@ void __meminit kswapd_run(int nid)
 		} else {
 			wake_up_process(pgdat->kswapd);
 		}
-#if defined(CONFIG_LRU_MARIE) && defined(CONFIG_SWAP)
+#if defined(CONFIG_LRU_CAST) && defined(CONFIG_SWAP)
 		ret = kfifo_alloc(&pgdat->kcompressd_fifo,
 				KCOMPRESSD_FIFO_SIZE * sizeof(struct folio *),
 				GFP_KERNEL);
@@ -8220,7 +7927,7 @@ void __meminit kswapd_run(int nid)
 		}
 #endif
 	}
-#if defined(CONFIG_LRU_MARIE) && defined(CONFIG_SWAP)
+#if defined(CONFIG_LRU_CAST) && defined(CONFIG_SWAP)
 out:
 #endif
 	pgdat_kswapd_unlock(pgdat);
@@ -8241,7 +7948,7 @@ void __meminit kswapd_stop(int nid)
 		kthread_stop(kswapd);
 		pgdat->kswapd = NULL;
 	}
-#if defined(CONFIG_LRU_MARIE) && defined(CONFIG_SWAP)
+#if defined(CONFIG_LRU_CAST) && defined(CONFIG_SWAP)
 	if (pgdat->kcompressd) {
 		kthread_stop(pgdat->kcompressd);
 		pgdat->kcompressd = NULL;
@@ -8251,42 +7958,13 @@ void __meminit kswapd_stop(int nid)
 	pgdat_kswapd_unlock(pgdat);
 }
 
-#ifdef CONFIG_LRU_MARIE
-/*
- * vm.swappiness write notifier for the Marie LRU controller. Calls the
- * default proc_dointvec_minmax to perform range-checked storage into
- * vm_swappiness, then, on a successful write, notifies Marie so it can reset
- * the single global swap_bias counter. Skipped on read or validation failure.
- */
-static int marie_swappiness_sysctl_handler(const struct ctl_table *table,
-					   int write, void *buffer,
-					   size_t *lenp, loff_t *ppos)
-{
-	int ret = proc_dointvec_minmax(table, write, buffer, lenp, ppos);
-
-	if (write && !ret)
-		lru_marie_swappiness_changed();
-	return ret;
-}
-#endif
-
 static const struct ctl_table vmscan_sysctl_table[] = {
 	{
 		.procname	= "swappiness",
 		.data		= &vm_swappiness,
 		.maxlen		= sizeof(vm_swappiness),
 		.mode		= 0644,
-#ifdef CONFIG_LRU_MARIE
-		/*
-		 * Marie wraps the default minmax handler so that a sysctl
-		 * write resets the single global swap_bias counter to zero.
-		 * See mm/lru_marie/state.c::marie_swap_bias_update for the
-		 * controller this notification clears.
-		 */
-		.proc_handler	= marie_swappiness_sysctl_handler,
-#else
 		.proc_handler	= proc_dointvec_minmax,
-#endif
 		.extra1		= SYSCTL_ZERO,
 		.extra2		= SYSCTL_TWO_HUNDRED,
 	},

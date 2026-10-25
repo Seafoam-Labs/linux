@@ -93,18 +93,6 @@ struct alloc_context {
 	bool spread_dirty_pages;
 	/* Only flags that are global to the whole allocation go here. */
 	unsigned int alloc_flags;
-
-	/*
-	 * Snapshot of the global workingset refault counters (anon + file) at
-	 * the previous should_reclaim_retry check for this allocation.
-	 * should_reclaim_retry takes the delta to tell real reclaim progress
-	 * from a thrash treadmill: when the pages reclaimed during a retry
-	 * loop are dwarfed by working-set refaults over the same window, the
-	 * "progress" is other tasks' working sets being pulled straight back
-	 * in, and must not keep resetting no_progress_loops (else a RAM-backed
-	 * swap device that never looks full livelocks the OOM path forever).
-	 */
-	unsigned long last_refaults;
 };
 
 /*

@@ -42,6 +42,7 @@
 #include <linux/kernel_stat.h>
 #include <linux/mm.h>
 #include <linux/mm_inline.h>
+#include <linux/lru_cast.h>
 #include <linux/sched/mm.h>
 #include <linux/sched/numa_balancing.h>
 #include <linux/sched/task.h>
@@ -5218,6 +5219,8 @@ check_folio:
 					 rmap_flags);
 		folio_put_swap(folio, nr_pages == 1 ? page : NULL);
 	}
+	/* CAST: a read of the page, now that it has an identity */
+	lru_cast_swapin(folio);
 
 	VM_BUG_ON(!folio_test_anon(folio) ||
 			(pte_write(pte) && !PageAnonExclusive(page)));
@@ -5537,6 +5540,7 @@ oom:
  */
 static vm_fault_t __do_fault(struct vm_fault *vmf)
 {
+	u64 t0;
 	struct vm_area_struct *vma = vmf->vma;
 	struct folio *folio;
 	vm_fault_t ret;
@@ -5562,7 +5566,15 @@ static vm_fault_t __do_fault(struct vm_fault *vmf)
 			return VM_FAULT_OOM;
 	}
 
+	t0 = lru_cast_cost_start();
 	ret = vma->vm_ops->fault(vmf);
+	/*
+	 * CAST: what bringing a page back in cost the task -- a shmem
+	 * swap-in, a refault by nature; filemap_fault() takes file's waits.
+	 */
+	if ((ret & VM_FAULT_MAJOR) && !(ret & VM_FAULT_ERROR) && vmf->page &&
+	    !folio_is_file_lru(page_folio(vmf->page)))
+		lru_cast_cost(LRU_CAST_ANON, t0, true);
 	if (unlikely(ret & (VM_FAULT_ERROR | VM_FAULT_NOPAGE | VM_FAULT_RETRY |
 			    VM_FAULT_DONE_COW)))
 		return ret;
@@ -6325,6 +6337,10 @@ static vm_fault_t do_numa_page(struct vm_fault *vmf)
 	if (!folio || folio_is_zone_device(folio))
 		goto out_map;
 
+	/* CAST's protection fault on a sampled page, not NUMA's */
+	if (lru_cast_protfault(folio))
+		goto out_map;
+
 	nid = folio_nid(folio);
 	nr_pages = folio_nr_pages(folio);
 
@@ -6557,8 +6573,19 @@ static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
 	if (!vmf->pte)
 		return do_pte_missing(vmf);
 
-	if (!pte_present(vmf->orig_pte))
-		return do_swap_page(vmf);
+	if (!pte_present(vmf->orig_pte)) {
+		u64 t0 = lru_cast_cost_start();
+		vm_fault_t ret = do_swap_page(vmf);
+
+		/*
+		 * CAST: what bringing a page back in cost the task, a
+		 * refault by nature -- unless it was told not to wait for it
+		 */
+		if ((ret & VM_FAULT_MAJOR) &&
+		    !((ret & VM_FAULT_RETRY) && (vmf->flags & FAULT_FLAG_RETRY_NOWAIT)))
+			lru_cast_cost(LRU_CAST_ANON, t0, true);
+		return ret;
+	}
 
 	if (pte_protnone(vmf->orig_pte) && vma_is_accessible(vmf->vma)) {
 		/*

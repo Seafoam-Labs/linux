@@ -17,7 +17,7 @@ struct swap_iocb {
 struct swap_io_ctx {
 	struct swap_iocb	*sio;
 	struct swap_info_struct	*sis;
-#ifdef CONFIG_LRU_MARIE
+#ifdef CONFIG_LRU_CAST
 	/*
 	 * Suppress swap_add_folio()'s force-submit-per-folio on
 	 * SWP_SYNCHRONOUS_IO devices so a batch of folios coalesces into one
@@ -25,7 +25,7 @@ struct swap_io_ctx {
 	 * it is not the reclaimer, so nothing is waiting on the folios'
 	 * writeback bit for reclaim progress. Every other swap_io_ctx is
 	 * zero-initialised ("= {}") and therefore keeps stock behaviour.
-	 * Marie-only; the field does not exist under CONFIG_LRU_MARIE=n.
+	 * CAST only; the field does not exist under CONFIG_LRU_CAST=n.
 	 */
 	bool			defer_sync_submit;
 #endif
