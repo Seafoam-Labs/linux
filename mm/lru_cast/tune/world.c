@@ -5,7 +5,7 @@
  * A point of the curve is a world: memory held at that split, as the real
  * cache would be -- anon's cache at k tenths and file's at the rest are one
  * cache of all memory's sample, and on a miss with it full the type over
- * its share gives, as reclaim takes. A type short of its share leaves the
+ * its share gives: the split held, which reclaim presses toward. A type short of its share leaves the
  * rest to the other: a world is what memory would be at its split, not at
  * one where each type fills its share whatever it needs.
  *

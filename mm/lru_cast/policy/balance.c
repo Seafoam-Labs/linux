@@ -8,11 +8,15 @@
  * sample and sets anon's share of memory at the split that costs least,
  * anon's misses weighed against file's by what their refaults cost --
  * swappiness in its first meaning, (MAX_SWAPPINESS - s) : s. Reclaim then
- * takes from the type over its share -- before the curves can compare,
- * the split memory had when reclaim first chose, so that each type pays
- * for its own. On the
- * last pass before OOM (priority 0) it takes from both by their sizes:
- * the type over its share may have nothing left to give.
+ * presses both types toward that share, a page of each by how far its type
+ * is over the share -- its part of memory over its share, against the
+ * other's -- as a swappiness, held within 1..MAX_SWAPPINESS - 1 as one an
+ * administrator sets is: at the share the two are pressed alike, the
+ * further over it the harder, and never is a type left alone. A type that
+ * will not give, its pages in use, keeps them, and the other gives in its
+ * place. Before the curves can compare, the share is the split memory had
+ * when reclaim first chose, so that each type pays for its own. On the
+ * last pass before OOM (priority 0) it takes from both by their sizes.
  *
  * Three values of swappiness are promises, kept outside the measure:
  *
@@ -51,8 +55,8 @@
 
 static unsigned int lru_cast_clean_min_ratio = 10;
 
-/* reclaim calls that took anon, took file, took nothing, took both by size */
-static atomic_long_t lru_cast_picks[4];
+/* reclaim calls that took anon, took file, took nothing, both by size, both by share */
+static atomic_long_t lru_cast_picks[5];
 
 /* node passes the floor held for */
 static atomic_long_t lru_cast_floor_held;
@@ -115,8 +119,24 @@ static noinline void lru_cast_hold_share(void)
 				     100UL, 900UL));
 }
 
+/*
+ * The pressure on a page of each type, as a swappiness: each type's part of
+ * memory over its share, anon's against file's, no further apart than 1:199
+ */
+static void lru_cast_pressure(unsigned long anon, unsigned long file, u64 *weight)
+{
+	unsigned int share = clamp(lru_cast_param_share(), 1U, 999U);
+	u64 wa = div64_u64((u64)anon * 1000000, (u64)(anon + file) * share);
+	u64 wf = div64_u64((u64)file * 1000000, (u64)(anon + file) * (1000 - share));
+	u64 sw = clamp(div64_u64(wa * MAX_SWAPPINESS, max(wa + wf, 1ULL)),
+		       1ULL, MAX_SWAPPINESS - 1ULL);
+
+	weight[LRU_CAST_ANON] = sw;
+	weight[LRU_CAST_FILE] = MAX_SWAPPINESS - sw;
+}
+
 int lru_cast_pick(struct lruvec *lruvec, int swappiness, int priority, bool anon_ok,
-		   bool file_ok)
+		   bool file_ok, u64 *weight)
 {
 	unsigned long anon = lruvec_page_state(lruvec, NR_INACTIVE_ANON) +
 			     lruvec_page_state(lruvec, NR_ACTIVE_ANON);
@@ -135,11 +155,11 @@ int lru_cast_pick(struct lruvec *lruvec, int swappiness, int priority, bool anon
 			pick = LRU_CAST_ANON;
 		else if (!priority)	/* the last pass before OOM: both, by size */
 			pick = LRU_CAST_EQUAL;
-		else {	/* the type over its share gives */
+		else {	/* both, pressed toward the share */
 			if (unlikely(!lru_cast_param_share_held()))
 				lru_cast_hold_share();
-			pick = (u64)anon * 1000 > (u64)lru_cast_param_share() * (anon + file) ?
-			       LRU_CAST_ANON : LRU_CAST_FILE;
+			lru_cast_pressure(anon, file, weight);
+			pick = LRU_CAST_BOTH;
 		}
 	} else if (anon_ok) {
 		pick = LRU_CAST_ANON;
@@ -148,8 +168,7 @@ int lru_cast_pick(struct lruvec *lruvec, int swappiness, int priority, bool anon
 	} else {
 		pick = LRU_CAST_NONE;
 	}
-	atomic_long_inc(&lru_cast_picks[pick == LRU_CAST_NONE ? 2 :
-					 pick == LRU_CAST_EQUAL ? 3 : pick]);
+	atomic_long_inc(&lru_cast_picks[pick == LRU_CAST_NONE ? 2 : pick]);
 	return pick;
 }
 
@@ -173,9 +192,10 @@ int lru_cast_floor_held_show(char *buf)
 
 int lru_cast_balance_show(char *buf)
 {
-	return sysfs_emit(buf, "anon %ld\nfile %ld\nnone %ld\nequal %ld\n",
+	return sysfs_emit(buf, "anon %ld\nfile %ld\nnone %ld\nequal %ld\nboth %ld\n",
 			  atomic_long_read(&lru_cast_picks[0]),
 			  atomic_long_read(&lru_cast_picks[1]),
 			  atomic_long_read(&lru_cast_picks[2]),
-			  atomic_long_read(&lru_cast_picks[3]));
+			  atomic_long_read(&lru_cast_picks[3]),
+			  atomic_long_read(&lru_cast_picks[4]));
 }

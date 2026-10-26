@@ -10,15 +10,17 @@
 #include <linux/jump_label.h>
 #include <linux/ktime.h>
 #include <linux/xarray.h>
+#include <linux/sched.h>
 
 struct folio;
 struct page;
 
-/* lru_cast_pick(): the type a reclaim call takes from */
+/* lru_cast_pick(): what a reclaim call takes from */
 #define LRU_CAST_ANON		0
 #define LRU_CAST_FILE		1
 #define LRU_CAST_NONE		(-1)
 #define LRU_CAST_EQUAL		3	/* both, by size */
+#define LRU_CAST_BOTH		4	/* both, each pressed by the weight handed back */
 
 #ifdef CONFIG_LRU_CAST
 
@@ -30,12 +32,19 @@ static inline bool lru_cast_enabled(void)
 	return static_branch_likely(&lru_cast_enabled_key);
 }
 
+/* CAST is on, as /sys/kernel/mm/lru_cast/enabled says */
+bool lru_cast_is_enabled(void);
+/* held across a switch of MGLRU (lru_gen_change_state()): never both on */
+void lru_cast_switch_begin(void);
+void lru_cast_switch_end(void);
+
 #ifdef CONFIG_SWAP
 /*
  * kcompressd (mm/page_io.c): kswapd hands its anon swap-outs to a thread
  * per node. /sys/kernel/mm/lru_cast/kcompressd, -100..100: 0 off; the
  * magnitude the queue's depth, at which kswapd writes a folio itself;
- * above 0 only while CAST is on, below 0 also with CAST off.
+ * above 0 only while CAST is on, below 0 whatever runs: CAST, MGLRU or
+ * legacy reclaim.
  */
 DECLARE_STATIC_KEY_TRUE(kcompressd_enabled_key);
 DECLARE_STATIC_KEY_FALSE(kcompressd_force_key);
@@ -72,7 +81,7 @@ struct lru_cast_scan {
 /* the node's clean file is at the floor: reclaim takes no file */
 bool lru_cast_floor_holds(struct pglist_data *pgdat);
 int lru_cast_pick(struct lruvec *lruvec, int swappiness, int priority, bool anon_ok,
-		   bool file_ok);
+		   bool file_ok, u64 *weight);
 unsigned long lru_cast_floor_file_pages(struct pglist_data *pgdat);
 
 bool __lru_cast_add_folio(struct lruvec *lruvec, struct folio *folio, bool tail);
@@ -84,20 +93,35 @@ void lru_cast_access_young(struct folio *folio);
 void lru_cast_access_kept(struct folio *folio);
 bool lru_cast_protfault(struct folio *folio);
 void lru_cast_swapin(struct folio *folio);
-void __lru_cast_cost(int type, u64 t0);
+void __lru_cast_wait_begin(int type, bool refault);
+void __lru_cast_wait_end(bool done);
 bool lru_cast_refaulted(struct folio *folio);
 
-/* the start of a wait for a page to come in: 0 when CAST is off */
-static inline u64 lru_cast_cost_start(void)
+/*
+ * A task's wait for a page of @type to come in, from where it is known to
+ * wait to where the call that waited returns (tune/cost.c): begun inside,
+ * where the page is found not in; its refault told when known; ended by the
+ * caller that every return of the inside passes through -- @done, unless
+ * the task gave up or was told not to wait.
+ */
+#define LRU_CAST_WAIT_REFAULT	0x80
+
+static inline void lru_cast_wait_begin(int type, bool refault)
 {
-	return lru_cast_enabled() ? ktime_get_ns() : 0;
+	if (lru_cast_enabled())
+		__lru_cast_wait_begin(type, refault);
 }
 
-/* a wait since @t0 for a page of @type to come back in, if @refault */
-static inline void lru_cast_cost(int type, u64 t0, bool refault)
+static inline void lru_cast_wait_refault(bool refault)
 {
-	if (t0 && refault)
-		__lru_cast_cost(type, t0);
+	if (current->lru_cast_wait && refault)
+		current->lru_cast_wait |= LRU_CAST_WAIT_REFAULT;
+}
+
+static inline void lru_cast_wait_end(bool done)
+{
+	if (unlikely(current->lru_cast_wait))
+		__lru_cast_wait_end(done);
 }
 void lru_cast_access_seen(struct folio *folio, bool referenced);
 void lru_cast_enter(struct folio *folio);
@@ -161,6 +185,19 @@ static inline bool lru_cast_shadow(void *shadow)
 
 #define LRU_CAST_SHADOW_KIND	0
 
+static inline bool lru_cast_is_enabled(void)
+{
+	return false;
+}
+
+static inline void lru_cast_switch_begin(void)
+{
+}
+
+static inline void lru_cast_switch_end(void)
+{
+}
+
 static inline bool lru_cast_shadow(void *shadow)
 {
 	return false;
@@ -203,7 +240,7 @@ static inline bool lru_cast_floor_holds(struct pglist_data *pgdat)
 }
 
 static inline int lru_cast_pick(struct lruvec *lruvec, int swappiness, int priority,
-				 bool anon_ok, bool file_ok)
+				 bool anon_ok, bool file_ok, u64 *weight)
 {
 	return -1;
 }
@@ -230,12 +267,15 @@ static inline void lru_cast_swapin(struct folio *folio)
 }
 
 
-static inline u64 lru_cast_cost_start(void)
+static inline void lru_cast_wait_begin(int type, bool refault)
 {
-	return 0;
 }
 
-static inline void lru_cast_cost(int type, u64 t0, bool refault)
+static inline void lru_cast_wait_refault(bool refault)
+{
+}
+
+static inline void lru_cast_wait_end(bool done)
 {
 }
 

@@ -4963,6 +4963,8 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 	if (folio)
 		swap_update_readahead(folio, vma, vmf->address);
 	if (!folio) {
+		/* CAST: a wait for the page from swap, ended by the caller */
+		lru_cast_wait_begin(LRU_CAST_ANON, true);
 		/* Swapin bypasses readahead for SWP_SYNCHRONOUS_IO devices */
 		if (data_race(si->flags & SWP_SYNCHRONOUS_IO))
 			folio = swapin_sync(entry, GFP_HIGHUSER_MOVABLE,
@@ -5540,7 +5542,6 @@ oom:
  */
 static vm_fault_t __do_fault(struct vm_fault *vmf)
 {
-	u64 t0;
 	struct vm_area_struct *vma = vmf->vma;
 	struct folio *folio;
 	vm_fault_t ret;
@@ -5566,15 +5567,13 @@ static vm_fault_t __do_fault(struct vm_fault *vmf)
 			return VM_FAULT_OOM;
 	}
 
-	t0 = lru_cast_cost_start();
 	ret = vma->vm_ops->fault(vmf);
 	/*
-	 * CAST: what bringing a page back in cost the task -- a shmem
-	 * swap-in, a refault by nature; filemap_fault() takes file's waits.
+	 * CAST: the end of a wait begun in it -- filemap_fault()'s, or a
+	 * shmem swap-in -- unless it failed or was told not to wait.
 	 */
-	if ((ret & VM_FAULT_MAJOR) && !(ret & VM_FAULT_ERROR) && vmf->page &&
-	    !folio_is_file_lru(page_folio(vmf->page)))
-		lru_cast_cost(LRU_CAST_ANON, t0, true);
+	lru_cast_wait_end(!(ret & VM_FAULT_ERROR) &&
+			  !((ret & VM_FAULT_RETRY) && (vmf->flags & FAULT_FLAG_RETRY_NOWAIT)));
 	if (unlikely(ret & (VM_FAULT_ERROR | VM_FAULT_NOPAGE | VM_FAULT_RETRY |
 			    VM_FAULT_DONE_COW)))
 		return ret;
@@ -6574,16 +6573,15 @@ static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
 		return do_pte_missing(vmf);
 
 	if (!pte_present(vmf->orig_pte)) {
-		u64 t0 = lru_cast_cost_start();
 		vm_fault_t ret = do_swap_page(vmf);
 
 		/*
-		 * CAST: what bringing a page back in cost the task, a
-		 * refault by nature -- unless it was told not to wait for it
+		 * CAST: the end of a swap-in begun in it, a refault by nature --
+		 * unless it failed or was told not to wait for it
 		 */
-		if ((ret & VM_FAULT_MAJOR) &&
-		    !((ret & VM_FAULT_RETRY) && (vmf->flags & FAULT_FLAG_RETRY_NOWAIT)))
-			lru_cast_cost(LRU_CAST_ANON, t0, true);
+		lru_cast_wait_end(!(ret & VM_FAULT_ERROR) &&
+				  !((ret & VM_FAULT_RETRY) &&
+				    (vmf->flags & FAULT_FLAG_RETRY_NOWAIT)));
 		return ret;
 	}
 

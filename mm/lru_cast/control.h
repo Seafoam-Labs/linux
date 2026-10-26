@@ -10,7 +10,6 @@
 #include <linux/types.h>
 
 int lru_cast_set_enabled(bool on);
-bool lru_cast_is_enabled(void);
 int lru_cast_sysfs_init(void);
 
 #endif /* _MM_LRU_CAST_CONTROL_H */

@@ -17,8 +17,16 @@
  * stale (nothing resets them at free); they are all cleared before it comes
  * back on, and with them goes all it had learnt: the shadows it left
  * (lru_cast_ghosts_forget()) and the controllers (lru_cast_tune_init()).
+ *
+ * CAST and MGLRU both run on the lists legacy reclaim leaves: one is
+ * switched off to them before the other is switched on from them, and
+ * never are both on. Either's switch is made under lru_cast_switch_lock
+ * (MGLRU's, lru_gen_change_state(), takes it before its own locks), and
+ * neither comes on while the other is: -EBUSY.
  */
 #include <linux/init.h>
+#include <linux/mm.h>
+#include <linux/mm_inline.h>
 #include <linux/mutex.h>
 #include "control.h"
 #include "core/core.h"
@@ -136,6 +144,10 @@ int lru_cast_set_enabled(bool on)
 
 	mutex_lock(&lru_cast_switch_lock);
 	if (on != READ_ONCE(lru_cast_active)) {
+		if (on && lru_gen_enabled()) {
+			err = -EBUSY;
+			goto out;
+		}
 		if (on) {
 			/* all it needs, or it stays off and says so */
 			err = lru_cast_store_init();
@@ -167,6 +179,17 @@ out:
 bool lru_cast_is_enabled(void)
 {
 	return READ_ONCE(lru_cast_active);
+}
+
+/* MGLRU's switch: CAST stays as it is while it is made */
+void lru_cast_switch_begin(void)
+{
+	mutex_lock(&lru_cast_switch_lock);
+}
+
+void lru_cast_switch_end(void)
+{
+	mutex_unlock(&lru_cast_switch_lock);
 }
 
 static int __init lru_cast_init(void)

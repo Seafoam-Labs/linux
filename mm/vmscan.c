@@ -2735,17 +2735,19 @@ static void get_scan_count(struct lruvec *lruvec, struct scan_control *sc,
 	}
 
 	/*
-	 * CAST takes from the type over its share of memory, the share
+	 * CAST presses both types toward anon's share of memory, the share
 	 * that loses least by the types' measured miss-ratio curves and what
-	 * their refaults cost; both by size while it is still learning them
-	 * (mm/lru_cast/balance.c). File under the clean-file floor is not on
-	 * offer.
+	 * their refaults cost, with a swappiness of its own, held within
+	 * 1..199 (mm/lru_cast/balance.c). File under the clean-file floor is
+	 * not on offer.
 	 */
 	if (lru_cast_on(lruvec)) {
+		u64 weight[ANON_AND_FILE];
+
 		switch (lru_cast_pick(lruvec, swappiness, sc->priority,
 				       sc->may_swap &&
 				       can_reclaim_anon_pages(memcg, pgdat->node_id, sc),
-				       !sc->clean_below_min)) {
+				       !sc->clean_below_min, weight)) {
 		case LRU_CAST_ANON:
 			scan_balance = SCAN_ANON;
 			goto out;
@@ -2754,6 +2756,12 @@ static void get_scan_count(struct lruvec *lruvec, struct scan_control *sc,
 			goto out;
 		case LRU_CAST_EQUAL:
 			scan_balance = SCAN_EQUAL;
+			goto out;
+		case LRU_CAST_BOTH:
+			fraction[0] = weight[LRU_CAST_ANON];
+			fraction[1] = weight[LRU_CAST_FILE];
+			denominator = MAX_SWAPPINESS;
+			scan_balance = SCAN_FRACT;
 			goto out;
 		default:
 			for_each_evictable_lru(lru)
@@ -2883,7 +2891,8 @@ static bool can_age_anon_pages(struct lruvec *lruvec,
 #ifdef CONFIG_LRU_GEN
 
 DEFINE_STATIC_KEY_FALSE(lru_switch);
-#ifdef CONFIG_LRU_GEN_ENABLED
+/* with CAST, CAST comes on at boot: MGLRU only without it (init_lru_gen()) */
+#if defined(CONFIG_LRU_GEN_ENABLED) && !defined(CONFIG_LRU_CAST)
 DEFINE_STATIC_KEY_ARRAY_TRUE(lru_gen_caps, NR_LRU_GEN_CAPS);
 #define get_cap(cap)	static_branch_likely(&lru_gen_caps[cap])
 #else
@@ -5546,12 +5555,15 @@ static bool drain_evictable(struct lruvec *lruvec)
 	return true;
 }
 
-static void lru_gen_change_state(bool enabled)
+static int lru_gen_change_state(bool enabled)
 {
 	static DEFINE_MUTEX(state_mutex);
 
 	struct mem_cgroup *memcg;
+	int err = 0;
 
+	/* CAST, on the same lists, is never on with it (mm/lru_cast/control.c) */
+	lru_cast_switch_begin();
 	cgroup_lock();
 	cpus_read_lock();
 	get_online_mems();
@@ -5559,6 +5571,11 @@ static void lru_gen_change_state(bool enabled)
 
 	if (enabled == lru_gen_enabled())
 		goto unlock;
+
+	if (enabled && lru_cast_is_enabled()) {
+		err = -EBUSY;
+		goto unlock;
+	}
 
 	static_branch_enable_cpuslocked(&lru_switch);
 
@@ -5600,6 +5617,8 @@ unlock:
 	put_online_mems();
 	cpus_read_unlock();
 	cgroup_unlock();
+	lru_cast_switch_end();
+	return err;
 }
 
 /******************************************************************************
@@ -5660,9 +5679,12 @@ static ssize_t enabled_store(struct kobject *kobj, struct kobj_attribute *attr,
 	for (i = 0; i < NR_LRU_GEN_CAPS; i++) {
 		bool enabled = caps & BIT(i);
 
-		if (i == LRU_GEN_CORE)
-			lru_gen_change_state(enabled);
-		else if (enabled)
+		if (i == LRU_GEN_CORE) {
+			int err = lru_gen_change_state(enabled);
+
+			if (err)
+				return err;
+		} else if (enabled)
 			static_branch_enable(&lru_gen_caps[i]);
 		else
 			static_branch_disable(&lru_gen_caps[i]);
@@ -6133,6 +6155,16 @@ static int __init init_lru_gen(void)
 				    &lru_gen_rw_fops);
 	debugfs_create_file_aux_num("lru_gen_full", 0444, NULL, NULL, true,
 				    &lru_gen_ro_fops);
+
+	/* CAST off (lru_cast=0): MGLRU comes on if it would have without CAST */
+	if (IS_ENABLED(CONFIG_LRU_GEN_ENABLED) && IS_ENABLED(CONFIG_LRU_CAST) &&
+	    !lru_gen_change_state(true)) {
+		int i;
+
+		for (i = 0; i < NR_LRU_GEN_CAPS; i++)
+			if (i != LRU_GEN_CORE)
+				static_branch_enable(&lru_gen_caps[i]);
+	}
 
 	return 0;
 };

@@ -7,9 +7,9 @@
  * a version bump rebuilds just those objects.
  */
 
-#define LRU_CAST_PROGNAME	"CAST"
+#define LRU_CAST_PROGNAME	"lru_cast"
 #define LRU_CAST_AUTHOR	"Masahito Suzuki"
 
-#define LRU_CAST_VERSION	"0.1.0"
+#define LRU_CAST_VERSION	"0.2.0"
 
 #endif /* _MM_LRU_CAST_VERSION_H */
