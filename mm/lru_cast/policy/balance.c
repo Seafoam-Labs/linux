@@ -174,13 +174,19 @@ static void lru_cast_pressure(unsigned long anon, unsigned long file, u64 *weigh
 	weight[LRU_CAST_FILE] = MAX_SWAPPINESS - sw;
 }
 
+/*
+ * What @lruvec holds of each type is read off its lists, as reclaim will
+ * scan them: a memcg's statistics are summed up only now and then, and a
+ * cgroup new to its limit can show none yet -- nothing to take, its
+ * reclaim scanning nothing, and the charge OOM.
+ */
 int lru_cast_pick(struct lruvec *lruvec, int swappiness, int priority, bool anon_ok,
 		   bool file_ok, u64 *weight)
 {
-	unsigned long anon = lruvec_page_state(lruvec, NR_INACTIVE_ANON) +
-			     lruvec_page_state(lruvec, NR_ACTIVE_ANON);
-	unsigned long file = lruvec_page_state(lruvec, NR_INACTIVE_FILE) +
-			     lruvec_page_state(lruvec, NR_ACTIVE_FILE);
+	unsigned long anon = lru_cast_lru_size(lruvec, LRU_INACTIVE_ANON) +
+			     lru_cast_lru_size(lruvec, LRU_ACTIVE_ANON);
+	unsigned long file = lru_cast_lru_size(lruvec, LRU_INACTIVE_FILE) +
+			     lru_cast_lru_size(lruvec, LRU_ACTIVE_FILE);
 	int pick;
 
 	if (swappiness <= 0)
