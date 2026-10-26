@@ -238,4 +238,3 @@ void __lru_cast_migrate(struct folio *dst, struct folio *src)
 	if (w)
 		lru_cast_installed(dst, folio_nr_pages(dst));
 }
-

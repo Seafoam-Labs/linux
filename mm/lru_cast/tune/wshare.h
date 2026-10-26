@@ -6,8 +6,7 @@
 #include "tune/sim.h"
 
 struct lru_cast_tune_w {
-	/* W's share and the test's anchor, in LRU_CAST_TUNE_WUNIT */
-	unsigned int wq, wanchor;
+	unsigned int wq;		/* W's share, in LRU_CAST_TUNE_WUNIT */
 	s64 ws, wn;			/* the test: w - 0.1C's misses less w + 0.1C's, and N */
 	unsigned long next_wtest, wmoves;
 };

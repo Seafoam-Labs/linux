@@ -14,6 +14,7 @@
 
 struct folio;
 struct page;
+struct address_space;
 
 /* lru_cast_pick(): what a reclaim call takes from */
 #define LRU_CAST_ANON		0
@@ -93,23 +94,103 @@ void lru_cast_access_young(struct folio *folio);
 void lru_cast_access_kept(struct folio *folio);
 bool lru_cast_protfault(struct folio *folio);
 void lru_cast_swapin(struct folio *folio);
-void __lru_cast_wait_begin(int type, bool refault);
+void __lru_cast_wait_begin(int type, bool refault, u64 dev);
+void __lru_cast_wait_queued(u64 dev);
+void __lru_cast_wait_begin_file(bool refault, struct address_space *mapping);
 void __lru_cast_wait_end(bool done);
+void __lru_cast_evict_cpu(u64 t0, unsigned long nr);
+void __lru_cast_evict_io_begin(u64 dev);
+void __lru_cast_evict_io_end(u64 dev, unsigned long nr);
+
+/*
+ * Writing out @nr pages of anon (tune/cost.c): done by the CPU since @t0
+ * (lru_cast_evict_start()), or queued on device @dev from submission to
+ * completion.
+ */
+static inline u64 lru_cast_evict_start(void)
+{
+	return lru_cast_enabled() ? ktime_get_ns() : 0;
+}
+
+static inline void lru_cast_evict_cpu(u64 t0, unsigned long nr)
+{
+	if (t0)
+		__lru_cast_evict_cpu(t0, nr);
+}
+
+static inline void lru_cast_evict_io_begin(u64 dev)
+{
+	if (lru_cast_enabled())
+		__lru_cast_evict_io_begin(dev);
+}
+
+static inline void lru_cast_evict_io_end(u64 dev, unsigned long nr)
+{
+	if (lru_cast_enabled())
+		__lru_cast_evict_io_end(dev, nr);
+}
 bool lru_cast_refaulted(struct folio *folio);
 
 /*
- * A task's wait for a page of @type to come in, from where it is known to
- * wait to where the call that waited returns (tune/cost.c): begun inside,
- * where the page is found not in; its refault told when known; ended by the
+ * A task's wait for a page of @type to come in (tune/cost.c), timed on the
+ * queue that does the work: a device's -- @dev, the id of its
+ * backing_dev_info (0: none known) -- or the CPU the task is on, when the
+ * task does it itself (LRU_CAST_DEV_CPU): a swap-in from zram, a zswap
+ * hit, a page that was all zeroes. Begun inside, where the task is known
+ * to wait for a page not in; its refault told when known; ended by the
  * caller that every return of the inside passes through -- @done, unless
  * the task gave up or was told not to wait.
+ *
+ * A swap-in: the fault names the entry it waits for, swap_read_folio()
+ * begins the wait when it reads that entry -- not for the pages read ahead
+ * with it -- on the CPU, and moves it to the device's queue if the page is
+ * read from one.
  */
+#define LRU_CAST_DEV_CPU	U64_MAX
+#define LRU_CAST_WAIT_TYPE	0x03	/* 1 + its type */
+#define LRU_CAST_WAIT_CPU	0x40	/* on the CPU's queue, not a device's */
 #define LRU_CAST_WAIT_REFAULT	0x80
 
-static inline void lru_cast_wait_begin(int type, bool refault)
+static inline void lru_cast_wait_begin(int type, bool refault, u64 dev)
 {
 	if (lru_cast_enabled())
-		__lru_cast_wait_begin(type, refault);
+		__lru_cast_wait_begin(type, refault, dev);
+}
+
+/* a wait for a page of @mapping, on the device it is read from */
+static inline void lru_cast_wait_begin_file(bool refault, struct address_space *mapping)
+{
+	if (lru_cast_enabled())
+		__lru_cast_wait_begin_file(refault, mapping);
+}
+
+/* a fault about to read swap entry @val */
+static inline void lru_cast_wait_swapin(unsigned long val)
+{
+	if (lru_cast_enabled())
+		current->lru_cast_wait_swap = val;
+}
+
+/* swap_read_folio() of the entries @first.. (@nr): the fault's own? */
+static inline bool lru_cast_wait_swap_mine(unsigned long first, unsigned long nr)
+{
+	unsigned long want = current->lru_cast_wait_swap;
+
+	return unlikely(want) && want - first < nr;
+}
+
+/* the fault's own entry read: its wait begins, on the CPU */
+static inline void lru_cast_wait_swap_read(unsigned long first, unsigned long nr)
+{
+	if (lru_cast_wait_swap_mine(first, nr) && !current->lru_cast_wait)
+		__lru_cast_wait_begin(LRU_CAST_ANON, true, LRU_CAST_DEV_CPU);
+}
+
+/* ... and read from device @dev: it queues there (asked once it is the fault's own) */
+static inline void lru_cast_wait_swap_queued(u64 dev)
+{
+	if (current->lru_cast_wait & LRU_CAST_WAIT_CPU)
+		__lru_cast_wait_queued(dev);
 }
 
 static inline void lru_cast_wait_refault(bool refault)
@@ -120,7 +201,7 @@ static inline void lru_cast_wait_refault(bool refault)
 
 static inline void lru_cast_wait_end(bool done)
 {
-	if (unlikely(current->lru_cast_wait))
+	if (unlikely(current->lru_cast_wait || current->lru_cast_wait_swap))
 		__lru_cast_wait_end(done);
 }
 void lru_cast_access_seen(struct folio *folio, bool referenced);
@@ -267,7 +348,45 @@ static inline void lru_cast_swapin(struct folio *folio)
 }
 
 
-static inline void lru_cast_wait_begin(int type, bool refault)
+static inline void lru_cast_wait_begin(int type, bool refault, u64 dev)
+{
+}
+
+static inline void lru_cast_wait_begin_file(bool refault, struct address_space *mapping)
+{
+}
+
+static inline u64 lru_cast_evict_start(void)
+{
+	return 0;
+}
+
+static inline void lru_cast_evict_cpu(u64 t0, unsigned long nr)
+{
+}
+
+static inline void lru_cast_evict_io_begin(u64 dev)
+{
+}
+
+static inline void lru_cast_evict_io_end(u64 dev, unsigned long nr)
+{
+}
+
+static inline void lru_cast_wait_swapin(unsigned long val)
+{
+}
+
+static inline bool lru_cast_wait_swap_mine(unsigned long first, unsigned long nr)
+{
+	return false;
+}
+
+static inline void lru_cast_wait_swap_read(unsigned long first, unsigned long nr)
+{
+}
+
+static inline void lru_cast_wait_swap_queued(u64 dev)
 {
 }
 

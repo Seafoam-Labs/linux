@@ -55,6 +55,7 @@
  *
  * Everything here runs under the lruvec's lru_lock but the work.
  */
+#include <linux/hash.h>
 #include <linux/sort.h>
 #include <linux/xarray.h>
 #include <linux/workqueue.h>
@@ -305,6 +306,28 @@ static long lru_cast_key_now(struct folio *folio, unsigned long tick, int le)
 	return lru_cast_key_res(lru_cast_read(folio), tick, le, LRU_CAST_RES);
 }
 
+/*
+ * A key ranked among its equals. Folios with one key -- read
+ * in the same ticks, the same number of times -- are taken in the order a
+ * sweep meets them, a cursor's over PFNs: a clock, a folio read again
+ * since it was found skipped. Of folios read more than once that is a loop's
+ * order, and a loop over more than M is served best by keeping the same
+ * part of itself: those are ranked by a hash of the PFN, the same of them
+ * going first each time. A folio read once keeps the clock's order. The
+ * rank is the key times 2^16, plus the hash; the key is the rank >> 16.
+ */
+static long lru_cast_rank(long key, unsigned long pfn, u32 w)
+{
+	if (key == LONG_MIN)
+		return LONG_MIN;
+	return key * 65536 + ((w >> 24) >= 2 ? hash_long(pfn, 16) : 0);
+}
+
+static long lru_cast_unrank(long rank)
+{
+	return rank == LONG_MIN ? LONG_MIN : rank >> 16;
+}
+
 static void lru_cast_flush(struct lru_cast *k)
 {
 	k->ncand = k->pos = 0;
@@ -347,12 +370,25 @@ void lru_cast_ring_admit(struct lruvec *lruvec, struct folio *folio, int type)
 {
 	struct lru_cast *k = &lruvec->lru_cast[type];
 	long b = lru_cast_key_now(folio, lru_cast_tick(lruvec_pgdat(lruvec), type), k->ring_le);
+	u32 w = lru_cast_read(folio);
+	/*
+	 * Read more than once, it is ranked as M's are; read once, by its key
+	 * alone: of one key, the newcomer is the one read last.
+	 */
+	bool ranked = (w >> 24) >= 2;
+	long r = lru_cast_rank(b, folio_pfn(folio), w), x = ranked ? r : b;
 	struct lru_cast_cand *c;
 
 	list_add(&folio->lru, lru_cast_m(lruvec, type));
 	lru_cast_m_enter(lruvec, folio, type);
-	if (k->pos < k->ncand ? b >= k->cand[k->pos].key : !k->tau_ok || b > k->tau)
+	if (k->pos < k->ncand) {
+		long lo = k->cand[k->pos].key;
+
+		if (x >= (ranked ? lo : lru_cast_unrank(lo)))
+			return;
+	} else if (!k->tau_ok || x > (ranked ? k->tau : lru_cast_unrank(k->tau))) {
 		return;
+	}
 	if (k->pos == k->ncand)
 		k->pos = k->ncand = 0;
 	if (k->pos) {
@@ -364,8 +400,8 @@ void lru_cast_ring_admit(struct lruvec *lruvec, struct folio *folio, int type)
 	}
 	c = &k->cand[k->pos];
 	c->pfn = folio_pfn(folio);
-	c->key = b;
-	c->word = lru_cast_read(folio);
+	c->key = r;
+	c->word = w;
 	sw_add(SW_GATE, 1);
 }
 
@@ -465,7 +501,7 @@ static void lru_cast_tau_probe(struct lruvec *lruvec, int type, unsigned int shi
 			continue;
 		if (lru_cast_spilled(owner) && !lru_cast_spill_ours(pfn, lruvec, type))
 			continue;
-		k->sample[n++] = lru_cast_key_res(w, tick, le, LRU_CAST_RES);
+		k->sample[n++] = lru_cast_rank(lru_cast_key_res(w, tick, le, LRU_CAST_RES), pfn, w);
 	}
 	k->seen = 0;
 	if (n < LRU_CAST_PROBE_MIN)
@@ -550,7 +586,7 @@ static void lru_cast_sweep(struct lruvec *lruvec, int type)
 		if (!(w >> 24))
 			continue;
 		words++;
-		key = lru_cast_key_res(w, tick, le, LRU_CAST_RES);
+		key = lru_cast_rank(lru_cast_key_res(w, tick, le, LRU_CAST_RES), pfn, w);
 		/* a reservoir sample of the pass's keys */
 		if (k->seen < LRU_CAST_SAMPLES) {
 			k->sample[k->seen] = key;
@@ -624,7 +660,7 @@ struct folio *lru_cast_ring_min(struct lruvec *lruvec, int type, long *bucket)
 			lru_cast_cand_ahead(k, k->pos - 1, false);
 			folio = lru_cast_cand_folio(lruvec, type, c);
 			if (folio) {
-				*bucket = c->key;
+				*bucket = lru_cast_unrank(c->key);
 				sw_add(SW_TAKEN, 1);
 				return folio;
 			}

@@ -27,6 +27,7 @@
 #include <linux/zswap.h>
 #include <linux/swap_ops.h>
 #include <linux/kfifo.h>
+#include <linux/backing-dev.h>
 #include <linux/lru_cast.h>
 #include "swap.h"
 #include "swap_table.h"
@@ -210,7 +211,10 @@ static void swap_zeromap_folio_clear(struct folio *folio)
  */
 static inline void do_swapout(struct swap_io_ctx *ctx, struct folio *folio)
 {
+	u64 t0 = lru_cast_evict_start();	/* CAST: zswap's compression */
+
 	if (zswap_store(folio)) {
+		lru_cast_evict_cpu(t0, folio_nr_pages(folio));
 		count_mthp_stat(folio_order(folio), MTHP_STAT_ZSWPOUT);
 		folio_unlock(folio);
 	} else
@@ -342,6 +346,8 @@ static inline bool kcompressd_store(struct folio *folio, bool handoff)
  */
 static int __swap_writeout(struct swap_io_ctx *ctx, struct folio *folio, bool handoff)
 {
+	unsigned long nr;
+	u64 t0;
 	int ret = 0;
 
 	if (folio_free_swap(folio))
@@ -356,6 +362,9 @@ static int __swap_writeout(struct swap_io_ctx *ctx, struct folio *folio, bool ha
 		folio_mark_dirty(folio);
 		goto out_unlock;
 	}
+	/* CAST: what writing it out costs, if done here, by the CPU */
+	t0 = lru_cast_evict_start();
+	nr = folio_nr_pages(folio);
 
 	/*
 	 * Use the swap table zero mark to avoid doing IO for zero-filled
@@ -364,6 +373,7 @@ static int __swap_writeout(struct swap_io_ctx *ctx, struct folio *folio, bool ha
 	 */
 	if (is_folio_zero_filled(folio)) {
 		swap_zeromap_folio_set(folio);
+		lru_cast_evict_cpu(t0, nr);
 		goto out_unlock;
 	}
 
@@ -384,6 +394,7 @@ static int __swap_writeout(struct swap_io_ctx *ctx, struct folio *folio, bool ha
 
 	if (zswap_store(folio)) {
 		count_mthp_stat(folio_order(folio), MTHP_STAT_ZSWPOUT);
+		lru_cast_evict_cpu(t0, nr);
 		goto out_unlock;
 	}
 
@@ -710,6 +721,12 @@ void swap_read_folio(struct swap_io_ctx *ctx, struct folio *folio)
 	}
 	delayacct_swapin_start();
 
+	/*
+	 * CAST: the page a fault waits for, read now -- by this CPU, unless it
+	 * is read from a device that queues it (lru_cast_wait_swap_queued())
+	 */
+	lru_cast_wait_swap_read(folio->swap.val, folio_nr_pages(folio));
+
 	if (swap_read_folio_zeromap(folio)) {
 		folio_unlock(folio);
 		goto finish;
@@ -720,6 +737,11 @@ void swap_read_folio(struct swap_io_ctx *ctx, struct folio *folio)
 
 	/* We have to read from slower devices. Increase zswap protection. */
 	zswap_folio_swapin(folio);
+
+	if (!synchronous || sis->ops != &swap_bdev_ops) {
+		if (lru_cast_wait_swap_mine(folio->swap.val, folio_nr_pages(folio)))
+			lru_cast_wait_swap_queued(inode_to_bdi(file_inode(sis->swap_file))->id);
+	}
 	swap_add_folio(ctx, folio, READ);
 
 finish:
@@ -780,6 +802,21 @@ static void end_swap_bio_write(struct bio *bio)
 	swap_write_end(sio, failed);
 }
 
+/* CAST: the device a swap bio queues on */
+static inline u64 swap_bio_dev(struct bio *bio)
+{
+	return bio->bi_bdev->bd_disk->bdi->id;
+}
+
+/* CAST: a swap-out queued on its device, ended (swap_bdev_submit_write()) */
+static void end_swap_bio_write_queued(struct bio *bio)
+{
+	struct swap_iocb *sio = container_of(bio, struct swap_iocb, bio);
+
+	lru_cast_evict_io_end(swap_bio_dev(bio), sio->len >> PAGE_SHIFT);
+	end_swap_bio_write(bio);
+}
+
 static void swap_read_end(struct swap_iocb *sio, bool failed)
 {
 	int p;
@@ -837,10 +874,17 @@ static void swap_bdev_submit_write(struct swap_io_ctx *ctx)
 	bio_associate_blkg_from_page(bio, bio_first_folio_all(bio));
 
 	if (ctx->sis->flags & SWP_SYNCHRONOUS_IO) {
+		/* CAST: the device's work, done by this CPU */
+		u64 t0 = lru_cast_evict_start();
+		unsigned long nr = sio->len >> PAGE_SHIFT;
+
 		submit_bio_wait(bio);
 		end_swap_bio_write(bio);
+		lru_cast_evict_cpu(t0, nr);
 	} else {
-		bio->bi_end_io = end_swap_bio_write;
+		bio->bi_end_io = end_swap_bio_write_queued;
+		/* CAST: the write queues on the device, until end_swap_bio_write_queued() */
+		lru_cast_evict_io_begin(swap_bio_dev(bio));
 		submit_bio(bio);
 	}
 }

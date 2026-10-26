@@ -2301,9 +2301,9 @@ static int shmem_swapin_folio(struct inode *inode, pgoff_t index,
 	/* Look it up and read it in.. */
 	folio = swap_cache_get_folio(swap);
 	if (!folio) {
-		/* CAST: a swap-in for a fault, ended by __do_fault() */
+		/* CAST: a swap-in for a fault, begun with its read, ended by __do_fault() */
 		if (fault_type)
-			lru_cast_wait_begin(LRU_CAST_ANON, true);
+			lru_cast_wait_swapin(swap.val);
 		if (data_race(si->flags & SWP_SYNCHRONOUS_IO)) {
 			/* Direct swapin skipping swap cache & readahead */
 			folio = shmem_swap_alloc_folio(inode, vmf, index,

@@ -3,11 +3,14 @@
  * CAST -- W's share of a type's pages, chosen by measuring.
  *
  * A sequential test of the gradient. S sums the misses of w - 0.1C less
- * those of w + 0.1C, N the accesses they disagree on, since the anchor.
+ * those of w + 0.1C, N the accesses they disagree on, since w last moved.
  * Every 1/64 of a cache of accesses, t = S / sqrt(N + 1): past +-2, w takes
- * a step of 0.1C / 64 towards the better side; once it is 0.1C from the
- * anchor -- a trust region -- the evidence is dropped and w is the new
- * anchor. It starts where the main cache's is.
+ * a step of 0.1C / 64 towards the better side, and the evidence is dropped:
+ * each step is taken on evidence gathered since the last. Kept, a sum that
+ * crossed once would carry w on a step every test whatever followed --
+ * and with nothing to choose between the two, a sum looked at again and
+ * again crosses 2 sooner or later: w would wander 0.1C at a time where
+ * now it only jitters. It starts where the main cache's is.
  */
 #include "tune/tune.h"
 #include "tune/wshare.h"
@@ -33,7 +36,7 @@ void lru_cast_tune_w_init(struct lru_cast_tune_w *w, unsigned int permille,
 			  struct lru_cast_tune_sim *sim)
 {
 	memset(w, 0, sizeof(*w));
-	w->wq = w->wanchor = permille * LRU_CAST_TUNE_WUNIT / 1000;
+	w->wq = permille * LRU_CAST_TUNE_WUNIT / 1000;
 	w->next_wtest = 8;
 	lru_cast_tune_w_apply(w, sim);
 }
@@ -72,10 +75,7 @@ void lru_cast_tune_w_test(struct lru_cast_tune_w *w, struct lru_cast_tune_sim *s
 		return;
 	w->wq = wq;
 	w->wmoves++;
-	if (abs((int)wq - (int)w->wanchor) >= LRU_CAST_TUNE_WRANGE) {
-		w->wanchor = wq;
-		w->ws = w->wn = 0;
-	}
+	w->ws = w->wn = 0;		/* each step on evidence of its own */
 	lru_cast_tune_w_apply(w, sim);
 	if (lru_cast_tune_auto())
 		lru_cast_param_set_w(type, wq * 1000 / LRU_CAST_TUNE_WUNIT);

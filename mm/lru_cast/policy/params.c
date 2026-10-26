@@ -14,20 +14,21 @@
 #include "policy/policy.h"
 
 /*
- * The decay starts at none. A decay too weak costs misses as long as it
- * lasts -- folios read often once and no more stay -- and the controllers
- * see them pile up; one too strong costs only after a scan, a few, the
+ * The decay starts at its weakest (core/core.h). A decay too weak costs
+ * misses as long as it lasts -- folios read often once and no more stay --
+ * and the controllers see them pile up; one too strong costs only after a scan, a few, the
  * folios read often until it began: too few, in the sample, to move the
  * decay back down before the next.
  */
 struct lru_cast_params lru_cast_params = {
-	.le = { 0, 0 },
+	.le = { LRU_CAST_LE_MIN, LRU_CAST_LE_MIN },
 	.share = 500,
 };
 
 void lru_cast_param_set_le(int type, unsigned int le)
 {
-	WRITE_ONCE(lru_cast_params.le[type], min(le, (unsigned int)LRU_CAST_LE_MAX));
+	WRITE_ONCE(lru_cast_params.le[type], clamp(le, (unsigned int)LRU_CAST_LE_MIN,
+						   (unsigned int)LRU_CAST_LE_MAX));
 }
 
 void lru_cast_param_set_w(int type, unsigned int permille)

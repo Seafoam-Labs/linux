@@ -3,7 +3,8 @@
  * CAST -- the key of a state word.
  *
  * The score of a folio is its read count decayed with a half-life of H
- * pages taken in (core/clock.c), H = C * 2^(8 - le) (le = 0: no decay):
+ * pages taken in (core/clock.c), H = C * 2^(8 - le), le from LRU_CAST_LE_MIN
+ * (H = 128 C) to LRU_CAST_LE_MAX:
  *
  *   s = sum_j 2^-(age_j / H) + max(n - 3, 0) * 2^-(age_oldest / H)
  *
@@ -20,8 +21,9 @@
  * 2^-res half-lives: the main cache's sweep (policy/ring.c) in sixteenths,
  * the controllers' simulated caches (tune/) in quarters, in a ring of
  * LRU_CAST_BUCKETS of them anchored at now: [top - 255, top], top = 4 E/H
- * + 32 (a folio read just now has log2 s < 8). With no decay the key is
- * the read count.
+ * + 32 (a folio read just now has log2 s < 8). With no decay (le = 0,
+ * which the policy no longer runs at: core/core.h) the key is the read
+ * count.
  *
  * Pure arithmetic on a state word and a clock.
  */
@@ -163,4 +165,3 @@ long lru_cast_window_lo(unsigned long tick, int le)
 		return 0;
 	return (long)((((tick * lru_cast_dq(le)) >> 8) + 8 * 256) >> 6) - (LRU_CAST_BUCKETS - 1);
 }
-
