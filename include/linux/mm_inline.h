@@ -104,7 +104,8 @@ static inline bool lru_gen_switching(void)
 
 	return static_branch_unlikely(&lru_switch);
 }
-#ifdef CONFIG_LRU_GEN_ENABLED
+/* as mm/vmscan.c's lru_gen_caps */
+#if defined(CONFIG_LRU_GEN_ENABLED) && !defined(CONFIG_LRU_CAST)
 static inline bool lru_gen_enabled(void)
 {
 	DECLARE_STATIC_KEY_TRUE(lru_gen_caps[NR_LRU_GEN_CAPS]);

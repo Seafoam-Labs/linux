@@ -1340,6 +1340,10 @@ struct task_struct {
 
 	/* VM state: */
 	struct reclaim_state		*reclaim_state;
+#ifdef CONFIG_LRU_CAST
+	/* CAST: the wait for a page to come in the task is in (mm/lru_cast/tune/cost.c) */
+	u8				lru_cast_wait;
+#endif
 
 	struct io_context		*io_context;
 

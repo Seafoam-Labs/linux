@@ -2622,14 +2622,16 @@ static int filemap_update_page(struct kiocb *iocb,
 		struct address_space *mapping, size_t count,
 		struct folio *folio, bool need_uptodate)
 {
-	u64 t0 = lru_cast_cost_start();
-	/* asked before the wait: the folio may be let go by then */
-	bool refault = t0 && lru_cast_refaulted(folio);
-	int error = __filemap_update_page(iocb, mapping, count, folio, need_uptodate);
+	/* a wait for a page not yet read; its refault asked before, the folio may go */
+	bool waits = !folio_test_uptodate(folio);
+	int error;
 
+	if (waits)
+		lru_cast_wait_begin(LRU_CAST_FILE, lru_cast_refaulted(folio));
+	error = __filemap_update_page(iocb, mapping, count, folio, need_uptodate);
 	/* not a wait: to be tried again, or waited for by no task */
-	lru_cast_cost(LRU_CAST_FILE, t0,
-		       refault && error != -EAGAIN && error != -EIOCBQUEUED);
+	if (waits)
+		lru_cast_wait_end(error != -EAGAIN && error != -EIOCBQUEUED);
 	return error;
 }
 
@@ -3581,7 +3583,6 @@ vm_fault_t filemap_fault(struct vm_fault *vmf)
 	vm_fault_t ret = 0;
 	bool mapping_locked = false;
 	/* CAST: a wait for the page to come in, if it is not yet */
-	u64 t0 = lru_cast_cost_start();
 	bool waits = false;
 
 	max_idx = DIV_ROUND_UP(i_size_read(inode), PAGE_SIZE);
@@ -3605,6 +3606,7 @@ vm_fault_t filemap_fault(struct vm_fault *vmf)
 			filemap_invalidate_lock_shared(mapping);
 			mapping_locked = true;
 			waits = true;
+			lru_cast_wait_begin(LRU_CAST_FILE, lru_cast_refaulted(folio));
 		}
 	} else {
 		ret = filemap_fault_recheck_pte_none(vmf);
@@ -3616,6 +3618,7 @@ vm_fault_t filemap_fault(struct vm_fault *vmf)
 		count_memcg_event_mm(vmf->vma->vm_mm, PGMAJFAULT);
 		ret = VM_FAULT_MAJOR;
 		waits = true;
+		lru_cast_wait_begin(LRU_CAST_FILE, false);	/* its refault told once in */
 		fpin = do_sync_mmap_readahead(vmf);
 retry_find:
 		/*
@@ -3697,8 +3700,8 @@ retry_find:
 		return VM_FAULT_SIGBUS;
 	}
 
-	if (waits)
-		lru_cast_cost(LRU_CAST_FILE, t0, t0 && lru_cast_refaulted(folio));
+	if (waits)	/* ended by __do_fault() */
+		lru_cast_wait_refault(lru_cast_refaulted(folio));
 	vmf->page = folio_file_page(folio, index);
 	return ret | VM_FAULT_LOCKED;
 
@@ -3728,9 +3731,8 @@ out_retry:
 	 * page.
 	 */
 	if (!IS_ERR(folio)) {
-		/* with RETRY_NOWAIT the task did not wait */
-		if (waits && !(vmf->flags & FAULT_FLAG_RETRY_NOWAIT))
-			lru_cast_cost(LRU_CAST_FILE, t0, t0 && lru_cast_refaulted(folio));
+		if (waits)	/* ended by __do_fault() */
+			lru_cast_wait_refault(lru_cast_refaulted(folio));
 		folio_put(folio);
 	}
 	if (mapping_locked)

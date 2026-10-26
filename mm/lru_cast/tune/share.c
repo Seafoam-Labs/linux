@@ -5,7 +5,7 @@
  * Chosen across the types from their curves: of the eleven splits
  * (0..10 tenths, world.c), the one that loses least -- anon's waits at k
  * tenths and file's at the rest, weighed by what their refaults cost
- * (cost.c). Reclaim takes from the type over the share
+ * (cost.c). Reclaim presses both types toward the share
  * (policy/balance.c). A curve, measured over the whole range, finds a
  * split a gradient would not: the gain of a loop that does not fit comes
  * all at once, when it does.
@@ -13,9 +13,8 @@
  * Nothing switches on how much has been learnt. The share is held, the
  * split memory had when reclaim first wanted it or the curves could first
  * compare, whichever came first, and moves only to a split they show
- * better at 2 sigma; reclaim takes from the type over it, so with no
- * evidence each type pays for what comes in of its own and the split stays
- * as it is. The curves can compare once the sample has seen LRU_CAST_TUNE_SHARE_SEEN
+ * better at 2 sigma; reclaim presses toward it, so with no evidence the
+ * split stays about as it is. The curves can compare once the sample has seen LRU_CAST_TUNE_SHARE_SEEN
  * of each type's reads: before, a split taken from memory would be the
  * few pages a booting system has, as it happened to be. The weights of the two types' misses come from
  * the estimate of what their refaults cost, which is the ratio swappiness
@@ -64,8 +63,8 @@ void lru_cast_tune_share_update(const struct lru_cast_tune_evidence *a,
 	/*
 	 * The share is held, and starts as the split memory has when reclaim
 	 * first wants it (policy/balance.c) or here, when the curves can first
-	 * compare: reclaim taking from the type over it, each type pays for
-	 * what comes in of its own and the split stays as it is. Until then
+	 * compare: reclaim pressing toward it, the split stays about as it
+	 * is. Until then
 	 * there is nothing to move. The curves move it only to a split they
 	 * show better at 2 sigma. The
 	 * spread of the difference between two splits comes from the accesses

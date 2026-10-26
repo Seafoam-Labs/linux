@@ -306,6 +306,12 @@ static void lru_gen_refault(struct folio *folio, void *shadow)
 
 	rcu_read_lock();
 
+	/* left by CAST before it was switched off: a refault, of no history here */
+	if (lru_cast_shadow(shadow)) {
+		mod_lruvec_state(folio_lruvec(folio), WORKINGSET_REFAULT_BASE + type, delta);
+		goto unlock;
+	}
+
 	recent = lru_gen_test_recent(shadow, &lruvec, &token, &workingset, type);
 	if (lruvec != folio_lruvec(folio))
 		goto unlock;
@@ -446,6 +452,15 @@ bool workingset_test_recent(void *shadow, bool file, bool *workingset,
 	struct pglist_data *pgdat;
 	unsigned long eviction;
 
+	if (lru_cast_enabled())
+		return lru_cast_test_recent(shadow, file, workingset);
+
+	/* left by CAST before it was switched off: no history here */
+	if (lru_cast_shadow(shadow)) {
+		*workingset = false;
+		return false;
+	}
+
 	if (lru_gen_enabled()) {
 		bool recent;
 
@@ -454,15 +469,6 @@ bool workingset_test_recent(void *shadow, bool file, bool *workingset,
 					     workingset, file);
 		rcu_read_unlock();
 		return recent;
-	}
-
-	if (lru_cast_enabled())
-		return lru_cast_test_recent(shadow, file, workingset);
-
-	/* left by CAST before it was switched off: no history here */
-	if (lru_cast_shadow(shadow)) {
-		*workingset = false;
-		return false;
 	}
 
 	rcu_read_lock();

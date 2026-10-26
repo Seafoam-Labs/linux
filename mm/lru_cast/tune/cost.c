@@ -28,6 +28,22 @@
  * nothing. The prior's scale is the two types' samples taken together
  * (1 ns with none), its ratio anon : file = (MAX_SWAPPINESS - s) : s.
  *
+ * A wait is timed as the device's part of it, not as the time from asking
+ * to having: while others wait too, a page comes in behind the ones asked
+ * before it, and the time it spent queued behind them is theirs. So, as
+ * ADIOS's latency model does, the waits of a type in flight together are a
+ * burst: each is the time from the end before it to its own, and the first
+ * to end, with no end before it, is timed from the burst's start, when the
+ * first of it began. The times add up to the burst's, from its start to its
+ * last end, however its waits interleave. The clock is read not at each:
+ * at a burst's start, at its last end, and every LRU_CAST_WAIT_BATCH ends
+ * between, the ends since the last reading sharing the time alike. A wait is in flight from where
+ * the task is known to wait for a page not in -- a swap-in, or a file page
+ * not yet read -- to where the call that waited returns; every wait counts
+ * to the bursts, those for a page back from an eviction are also the
+ * samples. What the device has queued that no task waits for -- readahead,
+ * writeback -- CAST cannot see.
+ *
  * Waits and their number are counted per CPU, where they happen, and
  * gathered at each evaluation.
  */
@@ -38,6 +54,14 @@
 
 static DEFINE_PER_CPU(u64, lru_cast_tune_wait[ANON_AND_FILE]);	/* ns */
 static DEFINE_PER_CPU(u64, lru_cast_tune_refaults[ANON_AND_FILE]);
+#define LRU_CAST_WAIT_BATCH	16	/* ends timed at one reading of the clock, about */
+
+/*
+ * Per type: the waits in flight; those ended and not yet timed, all of them
+ * (low half) and the refaults (high half); when the clock was last read.
+ */
+static atomic_t lru_cast_tune_inflight[ANON_AND_FILE];
+static atomic64_t lru_cast_tune_ended[ANON_AND_FILE], lru_cast_tune_mark[ANON_AND_FILE];
 
 static DEFINE_SPINLOCK(lru_cast_tune_cost_lock);
 /* forgetting */
@@ -45,10 +69,54 @@ static u64 lru_cast_tune_sum[ANON_AND_FILE], lru_cast_tune_n[ANON_AND_FILE];
 /* gathered so far */
 static u64 lru_cast_tune_last_wait[ANON_AND_FILE], lru_cast_tune_last_n[ANON_AND_FILE];
 
-void __lru_cast_cost(int type, u64 t0)
+/*
+ * The clock read at @now: the waits ended since it was last read share the
+ * time between, each alike; the refaults' part is their wait. Two readings
+ * at once may pair a time with the other's ends; both add up all the same.
+ */
+static void lru_cast_wait_time(int type, u64 now)
 {
-	this_cpu_add(lru_cast_tune_wait[type], ktime_get_ns() - t0);
-	this_cpu_inc(lru_cast_tune_refaults[type]);
+	u64 mark = atomic64_xchg(&lru_cast_tune_mark[type], now);
+	u64 ended = atomic64_xchg(&lru_cast_tune_ended[type], 0);
+	u64 n = (u32)ended, r = ended >> 32;
+
+	if (!r)
+		return;
+	/* now behind mark: read before another's reading, swapped in after it */
+	this_cpu_add(lru_cast_tune_wait[type],
+		     (s64)(now - mark) > 0 ? div64_u64((now - mark) * r, n) : 0);
+	this_cpu_add(lru_cast_tune_refaults[type], r);
+}
+
+void __lru_cast_wait_begin(int type, bool refault)
+{
+	/* one begun and never ended -- CAST switched off before it ended */
+	if (unlikely(current->lru_cast_wait))
+		__lru_cast_wait_end(false);
+	current->lru_cast_wait = (type + 1) | (refault ? LRU_CAST_WAIT_REFAULT : 0);
+	/* the first of a burst: the clock read at its start */
+	if (atomic_inc_return(&lru_cast_tune_inflight[type]) == 1)
+		lru_cast_wait_time(type, ktime_get_ns());
+}
+
+/* the task's wait ended: with the page in (@done), or given up */
+void __lru_cast_wait_end(bool done)
+{
+	u8 wait = current->lru_cast_wait;
+	int type = (wait & ~LRU_CAST_WAIT_REFAULT) - 1;
+	u64 ended = 0;
+
+	current->lru_cast_wait = 0;
+	if (done)
+		ended = atomic64_add_return(1 | (u64)!!(wait & LRU_CAST_WAIT_REFAULT) << 32,
+					    &lru_cast_tune_ended[type]);
+	/*
+	 * The last of a burst, or the end that makes a batch: the clock read.
+	 * The ends after it, before the reading takes the count, go with it.
+	 */
+	if (atomic_dec_if_positive(&lru_cast_tune_inflight[type]) <= 0 ||
+	    (u32)ended == LRU_CAST_WAIT_BATCH)
+		lru_cast_wait_time(type, ktime_get_ns());
 }
 
 /*
@@ -167,8 +235,11 @@ int lru_cast_tune_estimate_show(char *buf)
 	u64 ca, cf;
 
 	lru_cast_tune_costs(&ca, &cf);
-	return len + sysfs_emit_at(buf, len,
-				   "cost anon %llu ns (%llu waits) file %llu ns (%llu waits)\n",
-				   ca, READ_ONCE(lru_cast_tune_n[0]),
-				   cf, READ_ONCE(lru_cast_tune_n[1]));
+	len += sysfs_emit_at(buf, len,
+			     "cost anon %llu ns (%llu waits) file %llu ns (%llu waits)\n",
+			     ca, READ_ONCE(lru_cast_tune_n[0]),
+			     cf, READ_ONCE(lru_cast_tune_n[1]));
+	return len + sysfs_emit_at(buf, len, "in flight anon %d file %d\n",
+				   atomic_read(&lru_cast_tune_inflight[0]),
+				   atomic_read(&lru_cast_tune_inflight[1]));
 }
