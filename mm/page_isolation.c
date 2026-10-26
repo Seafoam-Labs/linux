@@ -80,8 +80,25 @@ bool page_is_unmovable(struct zone *zone, struct page *page,
 	 * because their page->_refcount is zero at all time.
 	 */
 	if (!page_ref_count(page)) {
-		if (PageBuddy(page))
-			*step = (1 << buddy_order(page));
+		if (PageBuddy(page)) {
+			/*
+			 * buddy_order_unsafe(), not buddy_order():
+			 * mm/lru_marie's defrag calls has_unmovable_pages() to
+			 * decide whether evacuating a pageblock could free it,
+			 * and does so WITHOUT zone->lock -- the answer only
+			 * steers candidate selection, and this function is
+			 * documented inexact anyway. Under the lock the two read
+			 * the same value, so the isolation caller is unaffected.
+			 * A racing read can return garbage, so clamp before
+			 * shifting rather than invoking undefined behaviour; a
+			 * bogus order just leaves *step at 1, meaning this page
+			 * is scanned one at a time instead of skipped.
+			 */
+			unsigned int order = buddy_order_unsafe(page);
+
+			if (order <= MAX_PAGE_ORDER)
+				*step = 1UL << order;
+		}
 		return false;
 	}
 
@@ -130,8 +147,16 @@ bool page_is_unmovable(struct zone *zone, struct page *page,
  * dereference that page (e.g., dumping), it has to make sure that it
  * cannot get removed (e.g., via memory unplug) concurrently.
  *
+ * The caller must guarantee [start_pfn, end_pfn) lies within one pageblock and
+ * that the range is backed by a valid section; page_isolation passes an
+ * intersection it has already validated, and mm/lru_marie passes a whole
+ * pageblock whose first pfn it checked with pfn_valid() (a pageblock cannot
+ * straddle a section, so that is sufficient).
+ *
+ * zone->lock is NOT required. start_isolate_page_range() happens to hold it;
+ * mm/lru_marie's defrag candidate check does not.
  */
-static struct page *has_unmovable_pages(unsigned long start_pfn, unsigned long end_pfn,
+struct page *has_unmovable_pages(unsigned long start_pfn, unsigned long end_pfn,
 				enum pb_isolate_mode mode)
 {
 	struct page *page = pfn_to_page(start_pfn);
