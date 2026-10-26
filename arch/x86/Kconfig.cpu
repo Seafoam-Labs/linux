@@ -280,6 +280,44 @@ config X86_NATIVE_CPU
 
 	  If unsure, say N.
 
+config CC_HAS_X86_64_ISA_LEVELS
+	def_bool $(cc-option,-march=x86-64-v3)
+
+config X86_64_VERSION
+	int "x86-64 compiler ISA level"
+	range 1 3
+	default 1
+	depends on X86_64 && !X86_NATIVE_CPU
+	depends on CC_HAS_X86_64_ISA_LEVELS
+	help
+	  Select the minimum x86-64 ISA level the compiler may target.
+
+	  Level 1 is the original x86-64 baseline and preserves the
+	  generic kernel build target.
+
+	  Level 2 adds the x86-64-v2 instruction set, including
+	  CMPXCHG16B, LAHF/SAHF and POPCNT, together with the SSE3,
+	  SSSE3, SSE4.1 and SSE4.2 ISA extensions.
+
+	  Level 3 adds the x86-64-v3 instruction set, including MOVBE,
+	  BMI1/BMI2 and LZCNT, together with AVX, AVX2, F16C and FMA.
+
+	  The kernel's normal no-SIMD build flags remain in force; higher
+	  ISA levels can therefore still enable useful scalar instructions
+	  without allowing generic kernel code to use vector registers.
+
+	  x86-64-v4 is intentionally not offered because its distinguishing
+	  feature set is AVX-512, which generic kernel code does not use.
+
+	  A kernel built for a given level may use instructions unavailable
+	  on older CPUs and therefore requires hardware compatible with that
+	  level. You can inspect the ISA levels supported by the current CPU
+	  with:
+
+	    /lib64/ld-linux-x86-64.so.2 --help | grep supported
+
+	  If unsure, say 1.
+
 config X86_GENERIC
 	bool "Generic x86 support"
 	depends on X86_32
