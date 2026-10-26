@@ -9,6 +9,7 @@
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/sched/signal.h>
+#include <linux/sched/wake_signal.h>
 #include <linux/fs.h>
 #include <linux/file.h>
 #include <linux/signal.h>
@@ -841,7 +842,7 @@ static void ep_resume_napi_irqs(struct eventpoll *ep)
 #ifdef CONFIG_DEBUG_LOCK_ALLOC
 
 static void ep_poll_safewake(struct eventpoll *ep, struct epitem *epi,
-			     unsigned pollflags)
+			     unsigned int pollflags, int wake_flags)
 {
 	struct eventpoll *ep_src;
 	unsigned long flags;
@@ -872,7 +873,8 @@ static void ep_poll_safewake(struct eventpoll *ep, struct epitem *epi,
 	}
 	spin_lock_irqsave_nested(&ep->poll_wait.lock, flags, nests);
 	ep->nests = nests + 1;
-	wake_up_locked_poll(&ep->poll_wait, EPOLLIN | pollflags);
+	__wake_up_locked_key_flags(&ep->poll_wait, TASK_NORMAL, wake_flags,
+				   poll_to_key(EPOLLIN | pollflags));
 	ep->nests = 0;
 	spin_unlock_irqrestore(&ep->poll_wait.lock, flags);
 }
@@ -880,9 +882,10 @@ static void ep_poll_safewake(struct eventpoll *ep, struct epitem *epi,
 #else
 
 static void ep_poll_safewake(struct eventpoll *ep, struct epitem *epi,
-			     __poll_t pollflags)
+			     __poll_t pollflags, int wake_flags)
 {
-	wake_up_poll(&ep->poll_wait, EPOLLIN | pollflags);
+	__wake_up_flags(&ep->poll_wait, TASK_NORMAL, 1, wake_flags,
+			poll_to_key(EPOLLIN | pollflags));
 }
 
 #endif
@@ -1239,7 +1242,7 @@ static void ep_clear_and_put(struct eventpoll *ep)
 {
 	/* Release any threads blocked in poll-on-ep. */
 	if (waitqueue_active(&ep->poll_wait))
-		ep_poll_safewake(ep, NULL, 0);
+		ep_poll_safewake(ep, NULL, 0, 0);
 
 	mutex_lock(&ep->mtx);
 	ep_drain_pollwaits(ep);
@@ -1558,10 +1561,9 @@ static int ep_poll_callback(wait_queue_entry_t *wait, unsigned mode, int sync, v
 				break;
 			}
 		}
-		if (sync)
-			wake_up_sync(&ep->wq);
-		else
-			wake_up(&ep->wq);
+		__wake_up_flags(&ep->wq, TASK_NORMAL, 1,
+				(sync & WF_SCX_SIGNAL_MASK) |
+				((sync & ~WF_SCX_SIGNAL_MASK) ? WF_SYNC : 0), NULL);
 	}
 	if (waitqueue_active(&ep->poll_wait))
 		pwake++;
@@ -1571,7 +1573,8 @@ out_unlock:
 
 	/* We have to call this outside the lock */
 	if (pwake)
-		ep_poll_safewake(ep, epi, pollflags & EPOLL_URING_WAKE);
+		ep_poll_safewake(ep, epi, pollflags & EPOLL_URING_WAKE,
+				 sync & WF_SCX_SIGNAL_MASK);
 
 	if (!(epi->event.events & EPOLLEXCLUSIVE))
 		ewake = 1;
@@ -1968,7 +1971,7 @@ static int ep_insert(struct ep_ctl_ctx *ctx, struct eventpoll *ep,
 
 	/* We have to call this outside the lock */
 	if (pwake)
-		ep_poll_safewake(ep, NULL, 0);
+		ep_poll_safewake(ep, NULL, 0, 0);
 
 	return 0;
 }
@@ -2044,7 +2047,7 @@ static int ep_modify(struct eventpoll *ep, struct epitem *epi,
 
 	/* We have to call this outside the lock */
 	if (pwake)
-		ep_poll_safewake(ep, NULL, 0);
+		ep_poll_safewake(ep, NULL, 0, 0);
 
 	return 0;
 }

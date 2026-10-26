@@ -8,9 +8,11 @@
  */
 #include <linux/bitmap.h>
 #include <linux/btf_ids.h>
+#include <linux/nospec.h>
 #include <linux/rhashtable.h>
 #include <linux/sched/clock.h>
 #include <linux/sched/isolation.h>
+#include <linux/sched/wake_signal.h>
 #include <linux/suspend.h>
 #include <linux/sysrq.h>
 
@@ -70,6 +72,16 @@ static LIST_HEAD(scx_tasks);
 /* ops enable/disable */
 static DEFINE_MUTEX(scx_enable_mutex);
 DEFINE_STATIC_KEY_FALSE(__scx_enabled);
+DEFINE_STATIC_KEY_FALSE(scx_wake_signal_enabled);
+
+void __scx_record_wake_signal(struct task_struct *p, int wake_flags)
+{
+	u64 cause = (wake_flags & WF_SCX_SIGNAL_MASK) >> WF_SCX_SIGNAL_SHIFT;
+
+	if (p->sched_class != &ext_sched_class)
+		return;
+	atomic64_set(&p->scx.wake_signal, cause ? (ktime_get_ns() & ~3ULL) | cause : 0);
+}
 DEFINE_STATIC_PERCPU_RWSEM(scx_fork_rwsem);
 static atomic_t scx_enable_state_var = ATOMIC_INIT(SCX_DISABLED);
 static DEFINE_RAW_SPINLOCK(scx_bypass_lock);
@@ -163,11 +175,23 @@ static DEFINE_PER_CPU(struct scx_tid_alloc, scx_tid_alloc);
  */
 static DEFINE_PER_CPU(struct task_struct *, direct_dispatch_task);
 
+static __always_inline int dsq_cmpfn(struct rhashtable_compare_arg *arg, const void *ptr)
+{
+	const struct scx_dispatch_q *dsq = ptr;
+
+	BUILD_BUG_ON(sizeof_field(struct scx_dispatch_q, id) != sizeof(u64));
+
+	return dsq->id != *(const u64 *)arg->key;
+}
+
 static const struct rhashtable_params dsq_hash_params = {
 	.key_len		= sizeof_field(struct scx_dispatch_q, id),
 	.key_offset		= offsetof(struct scx_dispatch_q, id),
 	.head_offset		= offsetof(struct scx_dispatch_q, hash_node),
+	.obj_cmpfn		= dsq_cmpfn,
 };
+
+#define SCX_DSQ_DIRECT_NR	2048
 
 static LLIST_HEAD(dsqs_to_free);
 
@@ -206,6 +230,7 @@ static struct kset *scx_kset;
  */
 static unsigned int scx_slice_bypass_us = SCX_SLICE_BYPASS / NSEC_PER_USEC;
 static unsigned int scx_bypass_lb_intv_us = SCX_BYPASS_LB_DFL_INTV_US;
+static bool scx_dsq_direct_enabled = true;
 
 static int set_slice_us(const char *val, const struct kernel_param *kp)
 {
@@ -234,6 +259,8 @@ module_param_cb(slice_bypass_us, &slice_us_param_ops, &scx_slice_bypass_us, 0600
 MODULE_PARM_DESC(slice_bypass_us, "bypass slice in microseconds, applied on [un]load (100us to 100ms)");
 module_param_cb(bypass_lb_intv_us, &bypass_lb_intv_us_param_ops, &scx_bypass_lb_intv_us, 0600);
 MODULE_PARM_DESC(bypass_lb_intv_us, "bypass load balance interval in microseconds (0 (disable) to 10s)");
+module_param_named(dsq_direct, scx_dsq_direct_enabled, bool, 0444);
+MODULE_PARM_DESC(dsq_direct, "index low DSQ IDs directly (disable for hash-only comparison)");
 
 #undef MODULE_PARAM_PREFIX
 
@@ -356,9 +383,23 @@ static struct scx_dispatch_q *find_global_dsq(struct scx_sched *sch, s32 cpu)
 	return &sch->pnode[cpu_to_node(cpu)]->global_dsq;
 }
 
-static struct scx_dispatch_q *find_user_dsq(struct scx_sched *sch, u64 dsq_id)
+static noinline struct scx_dispatch_q *find_user_dsq_hash(struct scx_sched *sch,
+							  u64 dsq_id)
 {
 	return rhashtable_lookup(&sch->dsq_hash, &dsq_id, dsq_hash_params);
+}
+
+static __always_inline struct scx_dispatch_q *find_user_dsq(struct scx_sched *sch,
+							    u64 dsq_id)
+{
+	struct scx_dispatch_q __rcu **direct = sch->dsq_direct;
+
+	if (dsq_id < SCX_DSQ_DIRECT_NR && direct) {
+		unsigned long idx = array_index_nospec(dsq_id, SCX_DSQ_DIRECT_NR);
+
+		return rcu_dereference(direct[idx]);
+	}
+	return find_user_dsq_hash(sch, dsq_id);
 }
 
 static const struct sched_class *scx_setscheduler_class(struct task_struct *p)
@@ -3040,6 +3081,8 @@ static void set_next_task_scx(struct rq *rq, struct task_struct *p, bool first)
 	/* see dequeue_task_scx() on why we skip when !QUEUED */
 	if (SCX_HAS_OP(sch, running) && (p->scx.flags & SCX_TASK_QUEUED))
 		SCX_CALL_OP_TASK(sch, running, rq, p);
+	if (static_branch_unlikely(&scx_wake_signal_enabled))
+		atomic64_set(&p->scx.wake_signal, 0);
 
 	clr_task_runnable(p, true);
 
@@ -3772,6 +3815,7 @@ static int __scx_init_task(struct scx_sched *sch, struct task_struct *p, bool fo
 	int ret;
 
 	p->scx.disallow = false;
+	atomic64_set(&p->scx.wake_signal, 0);
 
 	if (SCX_HAS_OP(sch, init_task)) {
 		struct scx_init_task_args args = {
@@ -4980,9 +5024,14 @@ static void destroy_dsq(struct scx_sched *sch, u64 dsq_id)
 		goto out_unlock_dsq;
 	}
 
-	if (rhashtable_remove_fast(&sch->dsq_hash, &dsq->hash_node,
-				   dsq_hash_params))
-		goto out_unlock_dsq;
+	/* Serialize both indexes against creation of the same ID. */
+	scoped_guard(raw_spinlock, &sch->dsq_index_lock) {
+		if (rhashtable_remove_fast(&sch->dsq_hash, &dsq->hash_node,
+					   dsq_hash_params))
+			goto out_unlock_dsq;
+		if (sch->dsq_direct && dsq_id < SCX_DSQ_DIRECT_NR)
+			RCU_INIT_POINTER(sch->dsq_direct[dsq_id], NULL);
+	}
 
 	/*
 	 * Mark dead by invalidating ->id to prevent dispatch_enqueue() from
@@ -5231,6 +5280,7 @@ static void scx_sched_free_rcu_work(struct work_struct *work)
 	rhashtable_walk_exit(&rht_iter);
 
 	rhashtable_free_and_destroy(&sch->dsq_hash, NULL, NULL);
+	kfree(sch->dsq_direct);
 	free_exit_info(sch->exit_info);
 	scx_set_cmask_scratch_free(sch);
 	scx_arena_pool_destroy(sch);
@@ -5255,6 +5305,15 @@ static ssize_t scx_attr_ops_show(struct kobject *kobj,
 	return sysfs_emit(buf, "%s\n", sch->ops.name);
 }
 SCX_ATTR(ops);
+
+static ssize_t scx_attr_dsq_direct_entries_show(struct kobject *kobj,
+						struct kobj_attribute *ka, char *buf)
+{
+	struct scx_sched *sch = container_of(kobj, struct scx_sched, kobj);
+
+	return sysfs_emit(buf, "%u\n", sch->dsq_direct ? SCX_DSQ_DIRECT_NR : 0);
+}
+SCX_ATTR(dsq_direct_entries);
 
 #define scx_attr_event_show(buf, at, events, kind) ({				\
 	sysfs_emit_at(buf, at, "%s %llu\n", #kind, (events)->kind);		\
@@ -5287,6 +5346,7 @@ SCX_ATTR(events);
 
 static struct attribute *scx_sched_attrs[] = {
 	&scx_attr_ops.attr,
+	&scx_attr_dsq_direct_entries.attr,
 	&scx_attr_events.attr,
 	NULL,
 };
@@ -6419,6 +6479,7 @@ static void scx_root_disable(struct scx_sched *sch)
 
 	/* no task is on scx, turn off all the switches and flush in-progress calls */
 	static_branch_disable(&__scx_enabled);
+	static_branch_disable(&scx_wake_signal_enabled);
 	static_branch_disable(&__scx_is_cid_type);
 	if (sch->ops.flags & SCX_OPS_TID_TO_TASK)
 		static_branch_disable(&__scx_tid_to_task_enabled);
@@ -7063,6 +7124,11 @@ static struct scx_sched *scx_alloc_and_add_sched(struct scx_enable_cmd *cmd,
 	if (ret < 0)
 		goto err_free_ei;
 
+	raw_spin_lock_init(&sch->dsq_index_lock);
+	if (scx_dsq_direct_enabled)
+		sch->dsq_direct = kcalloc(SCX_DSQ_DIRECT_NR, sizeof(*sch->dsq_direct),
+					  GFP_KERNEL | __GFP_NOWARN);
+
 	sch->pnode = kzalloc_objs(sch->pnode[0], nr_node_ids);
 	if (!sch->pnode) {
 		ret = -ENOMEM;
@@ -7249,6 +7315,7 @@ err_free_pnode:
 	kfree(sch->pnode);
 err_free_hash:
 	rhashtable_free_and_destroy(&sch->dsq_hash, NULL, NULL);
+	kfree(sch->dsq_direct);
 err_free_ei:
 	free_exit_info(sch->exit_info);
 err_free_sch:
@@ -7300,6 +7367,12 @@ static int validate_ops(struct scx_sched *sch, const struct sched_ext_ops *ops)
 	 * may set it to declare a dependency; reject if the root hasn't
 	 * enabled it.
 	 */
+	if ((ops->flags & SCX_OPS_WAKE_SIGNAL) && scx_parent(sch) &&
+	    !(scx_root->ops.flags & SCX_OPS_WAKE_SIGNAL)) {
+		scx_error(sch, "SCX_OPS_WAKE_SIGNAL requires root scheduler opt-in");
+		return -EINVAL;
+	}
+
 	if ((ops->flags & SCX_OPS_TID_TO_TASK) && scx_parent(sch) &&
 	    !(scx_root->ops.flags & SCX_OPS_TID_TO_TASK)) {
 		scx_error(sch, "SCX_OPS_TID_TO_TASK requires root scheduler to enable it");
@@ -7628,6 +7701,8 @@ static void scx_root_enable_workfn(struct kthread_work *work)
 	 */
 	WRITE_ONCE(scx_switching_all, !(ops->flags & SCX_OPS_SWITCH_PARTIAL));
 	static_branch_enable(&__scx_enabled);
+	if (ops->flags & SCX_OPS_WAKE_SIGNAL)
+		static_branch_enable(&scx_wake_signal_enabled);
 
 	/*
 	 * We're fully committed and can't fail. The task READY -> ENABLED
@@ -9567,8 +9642,12 @@ __bpf_kfunc s32 scx_bpf_create_dsq(u64 dsq_id, s32 node, const struct bpf_prog_a
 	sch = scx_prog_sched(aux);
 	if (sch) {
 		dsq->sched = sch;
-		ret = rhashtable_lookup_insert_fast(&sch->dsq_hash, &dsq->hash_node,
-						    dsq_hash_params);
+		scoped_guard(raw_spinlock_irqsave, &sch->dsq_index_lock) {
+			ret = rhashtable_lookup_insert_fast(&sch->dsq_hash, &dsq->hash_node,
+							    dsq_hash_params);
+			if (!ret && sch->dsq_direct && dsq_id < SCX_DSQ_DIRECT_NR)
+				rcu_assign_pointer(sch->dsq_direct[dsq_id], dsq);
+		}
 	} else {
 		ret = -ENODEV;
 	}
@@ -10470,6 +10549,49 @@ __bpf_kfunc s32 scx_bpf_task_cid(const struct task_struct *p)
 }
 
 /**
+ * scx_bpf_task_wake_signal_v1 - Read the current blocked-task wake token
+ * @p: trusted task pointer
+ *
+ * Bits 0/1 mean input packet/fence completion. Other bits are the accepted
+ * wake's CLOCK_MONOTONIC timestamp rounded down to four nanoseconds. Zero is
+ * unknown. The token is cleared after ops.running(), not on a failed wake.
+ */
+__bpf_kfunc u64 scx_bpf_task_wake_signal_v1(struct task_struct *p)
+{
+	if (!static_branch_unlikely(&scx_wake_signal_enabled))
+		return 0;
+	return atomic64_read(&p->scx.wake_signal);
+}
+
+/**
+ * scx_bpf_cpu_irq_ns_v1 - Read completed IRQ accounting without rq locking
+ * @cpu: CPU to query
+ * @aux: implicit BPF program context
+ *
+ * Returns U64_MAX for unknown/offline/unsupported data. This is a cumulative
+ * duration, not an active-handler indication; ksoftirqd task time is excluded.
+ * The 32-bit case is unsupported to avoid unbounded remote seqcount retries.
+ */
+__bpf_kfunc u64 scx_bpf_cpu_irq_ns_v1(s32 cpu, const struct bpf_prog_aux *aux)
+{
+#if defined(CONFIG_IRQ_TIME_ACCOUNTING) && defined(CONFIG_64BIT)
+	struct scx_sched *sch;
+	u64 total;
+
+	guard(rcu)();
+	if (cpu < 0 || cpu >= nr_cpu_ids || !cpu_online(cpu) || !irqtime_enabled())
+		return U64_MAX;
+	sch = scx_prog_sched(aux);
+	if (!sch || !scx_cpu_valid(sch, cpu, NULL))
+		return U64_MAX;
+	total = READ_ONCE(per_cpu(cpu_irqtime, cpu).total);
+	return cpu_online(cpu) && irqtime_enabled() ? total : U64_MAX;
+#else
+	return U64_MAX;
+#endif
+}
+
+/**
  * scx_bpf_cpu_rq - Fetch the rq of a CPU
  * @cpu: CPU of the rq
  * @aux: implicit BPF argument to access bpf_prog_aux hidden from BPF progs
@@ -10755,6 +10877,8 @@ out:
 __bpf_kfunc_end_defs();
 
 BTF_KFUNCS_START(scx_kfunc_ids_any)
+BTF_ID_FLAGS(func, scx_bpf_task_wake_signal_v1, KF_RCU)
+BTF_ID_FLAGS(func, scx_bpf_cpu_irq_ns_v1, KF_IMPLICIT_ARGS)
 BTF_ID_FLAGS(func, scx_bpf_task_set_slice, KF_IMPLICIT_ARGS | KF_RCU);
 BTF_ID_FLAGS(func, scx_bpf_task_set_dsq_vtime, KF_IMPLICIT_ARGS | KF_RCU);
 BTF_ID_FLAGS(func, scx_bpf_kick_cpu, KF_IMPLICIT_ARGS)

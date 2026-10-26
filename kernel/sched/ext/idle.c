@@ -25,6 +25,10 @@ static DEFINE_STATIC_KEY_FALSE(scx_selcpu_topo_llc);
 /* Enable/disable NUMA aware optimizations */
 static DEFINE_STATIC_KEY_FALSE(scx_selcpu_topo_numa);
 
+/* Lean built-in idle tracking (SCX_OPS_LEAN_IDLE) and its lazy SMT claim */
+static DEFINE_STATIC_KEY_FALSE(scx_idle_lean);
+static DEFINE_STATIC_KEY_FALSE(scx_idle_lean_lazy_smt);
+
 /*
  * cpumasks to track idle CPUs within each NUMA node.
  *
@@ -41,6 +45,28 @@ struct scx_idle_cpus {
  * is not enabled).
  */
 static struct scx_idle_cpus scx_idle_global_masks;
+
+/*
+ * SCX_OPS_LEAN_IDLE storage for the global masks: the idle CPU word and the
+ * idle SMT word in one cacheline pair that holds nothing else, so a claim
+ * or an idle transition moves one line between CPUs. Offstack cpumasks span
+ * nr_cpu_ids bits only when NR_CPUS > 4 * BITS_PER_LONG; elsewhere lean mode
+ * keeps the allocated masks.
+ */
+#if defined(CONFIG_CPUMASK_OFFSTACK) && NR_CPUS > 4 * BITS_PER_LONG
+#define SCX_IDLE_LEAN_LINE
+struct scx_idle_line {
+	unsigned long cpu;
+	unsigned long smt;
+} __aligned(2 * SMP_CACHE_BYTES);
+
+static struct scx_idle_line scx_idle_line;
+static struct cpumask *scx_idle_global_cpu_alloc;
+static struct cpumask *scx_idle_global_smt_alloc;
+#endif
+
+/* Each CPU's SMT siblings and itself as one word; zero for an impossible id. */
+static unsigned long scx_idle_lean_sib[BITS_PER_LONG] __read_mostly;
 
 /*
  * Per-node idle cpumasks.
@@ -76,10 +102,72 @@ static int scx_cpu_node_if_enabled(int cpu)
 	return cpu_to_node(cpu);
 }
 
+/*
+ * Claim @cpu in lean mode: single-word operations on the global masks with
+ * the precomputed sibling word. The SMT word is tested before it is
+ * written; with the lazy variant only a failed claim clears it, which still
+ * bounds scx_pick_idle_cpu()'s retries.
+ */
+static __always_inline bool scx_idle_lean_claim(int cpu)
+{
+	unsigned long *cpus = cpumask_bits(scx_idle_global_masks.cpu);
+	unsigned long *smts = cpumask_bits(scx_idle_global_masks.smt);
+	unsigned long sib = READ_ONCE(scx_idle_lean_sib[cpu]);
+	bool won;
+
+	if (!sched_smt_active())
+		return test_and_clear_bit(cpu, cpus);
+
+	if (static_branch_unlikely(&scx_idle_lean_lazy_smt)) {
+		won = test_and_clear_bit(cpu, cpus);
+		if (!won && (READ_ONCE(*smts) & sib))
+			WRITE_ONCE(*smts, READ_ONCE(*smts) & ~sib);
+		return won;
+	}
+
+	if (READ_ONCE(*smts) & sib)
+		WRITE_ONCE(*smts, READ_ONCE(*smts) & ~sib);
+	return test_and_clear_bit(cpu, cpus);
+}
+
+/*
+ * Lean idle transition: test before every write, so a busy transition that
+ * follows a successful claim only reads the line. Only @cpu sets its own
+ * idle bit, so a skipped write cannot lose a concurrent set.
+ */
+static __always_inline void scx_idle_lean_update(int cpu, bool idle)
+{
+	unsigned long *cpus = cpumask_bits(scx_idle_global_masks.cpu);
+	unsigned long *smts = cpumask_bits(scx_idle_global_masks.smt);
+	unsigned long bit = BIT(cpu), sib;
+
+	if (idle) {
+		if (!(READ_ONCE(*cpus) & bit))
+			set_bit(cpu, cpus);
+	} else if (READ_ONCE(*cpus) & bit) {
+		clear_bit(cpu, cpus);
+	}
+
+	if (!sched_smt_active())
+		return;
+
+	/* Racy like the generic path: an optimization that self-corrects. */
+	sib = READ_ONCE(scx_idle_lean_sib[cpu]);
+	if (idle) {
+		if ((READ_ONCE(*cpus) & sib) == sib && (READ_ONCE(*smts) & sib) != sib)
+			WRITE_ONCE(*smts, READ_ONCE(*smts) | sib);
+	} else if (READ_ONCE(*smts) & sib) {
+		WRITE_ONCE(*smts, READ_ONCE(*smts) & ~sib);
+	}
+}
+
 static bool scx_idle_test_and_clear_cpu(int cpu)
 {
 	int node = scx_cpu_node_if_enabled(cpu);
 	struct cpumask *idle_cpus = idle_cpumask(node)->cpu;
+
+	if (static_branch_unlikely(&scx_idle_lean))
+		return scx_idle_lean_claim(cpu);
 
 	/*
 	 * SMT mask should be cleared whether we can claim @cpu or not. The SMT
@@ -682,6 +770,10 @@ void scx_idle_init_masks(void)
 	/* Allocate global idle cpumasks */
 	BUG_ON(!alloc_cpumask_var(&scx_idle_global_masks.cpu, GFP_KERNEL));
 	BUG_ON(!alloc_cpumask_var(&scx_idle_global_masks.smt, GFP_KERNEL));
+#ifdef SCX_IDLE_LEAN_LINE
+	scx_idle_global_cpu_alloc = scx_idle_global_masks.cpu;
+	scx_idle_global_smt_alloc = scx_idle_global_masks.smt;
+#endif
 
 	/* Allocate per-node idle cpumasks (use nr_node_ids for non-contiguous NUMA nodes) */
 	scx_idle_node_masks = kzalloc_objs(*scx_idle_node_masks, nr_node_ids);
@@ -711,6 +803,11 @@ static void update_builtin_idle(int cpu, bool idle)
 {
 	int node = scx_cpu_node_if_enabled(cpu);
 	struct cpumask *idle_cpus = idle_cpumask(node)->cpu;
+
+	if (static_branch_unlikely(&scx_idle_lean)) {
+		scx_idle_lean_update(cpu, idle);
+		return;
+	}
 
 	assign_cpu(cpu, idle_cpus, idle);
 
@@ -812,8 +909,42 @@ static void reset_idle_masks(struct sched_ext_ops *ops)
 	}
 }
 
+/*
+ * Choose the global idle mask storage and lean mode for the scheduler being
+ * enabled. The built-in idle keys are off here (since boot, or through
+ * scx_idle_disable()), so no idle update or claim runs concurrently.
+ */
+static bool scx_idle_lean_setup(struct sched_ext_ops *ops)
+{
+	bool lean = (ops->flags & SCX_OPS_LEAN_IDLE) &&
+		    !(ops->flags & SCX_OPS_BUILTIN_IDLE_PER_NODE) &&
+		    (!ops->update_idle || (ops->flags & SCX_OPS_KEEP_BUILTIN_IDLE)) &&
+		    nr_cpu_ids <= BITS_PER_LONG;
+	int cpu;
+
+#ifdef SCX_IDLE_LEAN_LINE
+	scx_idle_global_masks.cpu = lean ? (struct cpumask *)&scx_idle_line.cpu :
+					   scx_idle_global_cpu_alloc;
+	scx_idle_global_masks.smt = lean ? (struct cpumask *)&scx_idle_line.smt :
+					   scx_idle_global_smt_alloc;
+#endif
+	if (!lean)
+		return false;
+
+	for (cpu = 0; cpu < BITS_PER_LONG; cpu++) {
+		unsigned long sib = 0;
+
+		if (cpu < nr_cpu_ids && cpu_possible(cpu))
+			sib = cpumask_bits(cpu_smt_mask(cpu))[0] | BIT(cpu);
+		WRITE_ONCE(scx_idle_lean_sib[cpu], sib);
+	}
+	return true;
+}
+
 void scx_idle_enable(struct sched_ext_ops *ops)
 {
+	bool lean = scx_idle_lean_setup(ops);
+
 	if (!ops->update_idle || (ops->flags & SCX_OPS_KEEP_BUILTIN_IDLE))
 		static_branch_enable_cpuslocked(&scx_builtin_idle_enabled);
 	else
@@ -825,10 +956,22 @@ void scx_idle_enable(struct sched_ext_ops *ops)
 		static_branch_disable_cpuslocked(&scx_builtin_idle_per_node);
 
 	reset_idle_masks(ops);
+
+	if (lean && (ops->flags & SCX_OPS_LEAN_IDLE_LAZY_SMT))
+		static_branch_enable_cpuslocked(&scx_idle_lean_lazy_smt);
+	else
+		static_branch_disable_cpuslocked(&scx_idle_lean_lazy_smt);
+
+	if (lean)
+		static_branch_enable_cpuslocked(&scx_idle_lean);
+	else
+		static_branch_disable_cpuslocked(&scx_idle_lean);
 }
 
 void scx_idle_disable(void)
 {
+	static_branch_disable(&scx_idle_lean);
+	static_branch_disable(&scx_idle_lean_lazy_smt);
 	static_branch_disable(&scx_builtin_idle_enabled);
 	static_branch_disable(&scx_builtin_idle_per_node);
 }
@@ -1295,6 +1438,15 @@ __bpf_kfunc void scx_bpf_put_idle_cpumask(const struct cpumask *idle_mask)
 __bpf_kfunc bool scx_bpf_test_and_clear_cpu_idle(s32 cpu, const struct bpf_prog_aux *aux)
 {
 	struct scx_sched *sch;
+
+	/*
+	 * Lean mode implies built-in idle tracking on the global masks, which
+	 * live as long as the kernel: no RCU, scheduler lookup or out-of-line
+	 * CPU check. An invalid @cpu takes the generic path, which reports it.
+	 */
+	if (static_branch_unlikely(&scx_idle_lean) && (u32)cpu < nr_cpu_ids &&
+	    (u32)cpu < BITS_PER_LONG && READ_ONCE(scx_idle_lean_sib[cpu]))
+		return scx_idle_lean_claim(cpu);
 
 	guard(rcu)();
 

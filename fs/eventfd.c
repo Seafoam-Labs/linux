@@ -11,6 +11,7 @@
 #include <linux/init.h>
 #include <linux/fs.h>
 #include <linux/sched/signal.h>
+#include <linux/sched/wake_signal.h>
 #include <linux/kernel.h>
 #include <linux/slab.h>
 #include <linux/list.h>
@@ -44,16 +45,18 @@ struct eventfd_ctx {
 };
 
 /**
- * eventfd_signal_mask - Increment the event counter
+ * eventfd_signal_mask_flags - Increment the event counter with a wake cause
  * @ctx: [in] Pointer to the eventfd context.
  * @mask: [in] poll mask
+ * @wake_flags: [in] internal typed readiness flags
  *
  * This function is supposed to be called by the kernel in paths that do not
  * allow sleeping. In this function we allow the counter to reach the ULLONG_MAX
  * value, and we signal this as overflow condition by returning a EPOLLERR
  * to poll(2).
  */
-void eventfd_signal_mask(struct eventfd_ctx *ctx, __poll_t mask)
+void eventfd_signal_mask_flags(struct eventfd_ctx *ctx, __poll_t mask,
+			       int wake_flags)
 {
 	unsigned long flags;
 
@@ -73,9 +76,17 @@ void eventfd_signal_mask(struct eventfd_ctx *ctx, __poll_t mask)
 	if (ctx->count < ULLONG_MAX)
 		ctx->count++;
 	if (waitqueue_active(&ctx->wqh))
-		wake_up_locked_poll(&ctx->wqh, EPOLLIN | mask);
+		__wake_up_locked_key_flags(&ctx->wqh, TASK_NORMAL,
+					   wake_flags & WF_SCX_SIGNAL_MASK,
+					   poll_to_key(EPOLLIN | mask));
 	current->in_eventfd = 0;
 	spin_unlock_irqrestore(&ctx->wqh.lock, flags);
+}
+EXPORT_SYMBOL_GPL(eventfd_signal_mask_flags);
+
+void eventfd_signal_mask(struct eventfd_ctx *ctx, __poll_t mask)
+{
+	eventfd_signal_mask_flags(ctx, mask, 0);
 }
 EXPORT_SYMBOL_GPL(eventfd_signal_mask);
 
@@ -420,4 +431,3 @@ SYSCALL_DEFINE1(eventfd, unsigned int, count)
 {
 	return do_eventfd(count, 0);
 }
-

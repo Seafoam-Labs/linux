@@ -8,6 +8,15 @@
  */
 #ifdef CONFIG_SCHED_CLASS_EXT
 
+DECLARE_STATIC_KEY_FALSE(scx_wake_signal_enabled);
+void __scx_record_wake_signal(struct task_struct *p, int wake_flags);
+
+static inline void scx_record_wake_signal(struct task_struct *p, int wake_flags)
+{
+	if (static_branch_unlikely(&scx_wake_signal_enabled))
+		__scx_record_wake_signal(p, wake_flags);
+}
+
 void scx_tick(struct rq *rq);
 void init_scx_entity(struct sched_ext_entity *scx);
 void scx_pre_fork(struct task_struct *p);
@@ -41,6 +50,8 @@ bool scx_prio_less(const struct task_struct *a, const struct task_struct *b,
 #endif
 
 #else	/* CONFIG_SCHED_CLASS_EXT */
+
+static inline void scx_record_wake_signal(struct task_struct *p, int wake_flags) {}
 
 static inline void scx_tick(struct rq *rq) {}
 static inline void scx_pre_fork(struct task_struct *p) {}

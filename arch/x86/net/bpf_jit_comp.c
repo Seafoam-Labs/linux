@@ -1628,6 +1628,40 @@ static void emit_priv_frame_ptr(u8 **pprog, void __percpu *priv_frame_ptr)
 	*pprog = prog;
 }
 
+static bool emit_scalar_bitop(u8 **pprog, const u8 *func)
+{
+#ifdef CONFIG_BPF_SYSCALL
+	u8 *prog = *pprog;
+	u8 opcode;
+
+	if (func == (const u8 *)bpf_mulhi64) {
+		/* r0 = mulhi(r1, r2), clobbering only call-scratch RAX/RDX. */
+		EMIT3(0x48, 0x89, 0xf8); /* mov RAX, RDI */
+		EMIT3(0x48, 0xf7, 0xe6); /* mul RSI */
+		EMIT3(0x48, 0x89, 0xd0); /* mov RAX, RDX */
+		*pprog = prog;
+		return true;
+	}
+
+	if (func == (const u8 *)bpf_ctz64 && boot_cpu_has(X86_FEATURE_BMI1))
+		opcode = 0xbc;
+	else if (func == (const u8 *)bpf_popcnt64 && boot_cpu_has(X86_FEATURE_POPCNT))
+		opcode = 0xb8;
+	else if (func == (const u8 *)bpf_clz64 && boot_cpu_has(X86_FEATURE_ABM))
+		opcode = 0xbd;
+	else
+		return false;
+
+	/* r0 = bitop(r1): RAX = bitop(RDI), normal BPF call ABI. */
+	EMIT4(0xf3, 0x48, 0x0f, opcode);
+	EMIT1(0xc7);
+	*pprog = prog;
+	return true;
+#else
+	return false;
+#endif
+}
+
 #define INSN_SZ_DIFF (((addrs[i] - addrs[i - 1]) - (prog - temp)))
 
 #define __LOAD_TCC_PTR(off)			\
@@ -2600,6 +2634,8 @@ populate_extable:
 
 			/* call */
 		case BPF_JMP | BPF_CALL: {
+			bool scalar_fastcall = false;
+
 			func = (u8 *) __bpf_call_base + imm32;
 			if (src_reg == BPF_PSEUDO_CALL && tail_call_reachable) {
 				LOAD_TAIL_CALL_CNT_PTR(stack_depth);
@@ -2607,6 +2643,23 @@ populate_extable:
 			}
 			if (!imm32)
 				return -EINVAL;
+			if (src_reg == BPF_PSEUDO_KFUNC_CALL &&
+			    emit_scalar_bitop(&prog, func))
+				break;
+#ifdef CONFIG_BPF_SYSCALL
+			if (src_reg == BPF_PSEUDO_KFUNC_CALL &&
+			    (func == (const u8 *)bpf_ctz64 ||
+			     func == (const u8 *)bpf_popcnt64 ||
+			     func == (const u8 *)bpf_clz64)) {
+				/* The C fallback must honor unary KF_FASTCALL too. */
+				EMIT1(0x56); /* push rsi (BPF R2) */
+				EMIT1(0x52); /* push rdx (BPF R3) */
+				EMIT1(0x51); /* push rcx (BPF R4) */
+				EMIT2(0x41, 0x50); /* push r8 (BPF R5) */
+				ip += 5;
+				scalar_fastcall = true;
+			}
+#endif
 			if (priv_frame_ptr) {
 				push_r9(&prog);
 				ip += 2;
@@ -2616,6 +2669,12 @@ populate_extable:
 				return -EINVAL;
 			if (priv_frame_ptr)
 				pop_r9(&prog);
+			if (scalar_fastcall) {
+				EMIT2(0x41, 0x58); /* pop r8 */
+				EMIT1(0x59); /* pop rcx */
+				EMIT1(0x5a); /* pop rdx */
+				EMIT1(0x5e); /* pop rsi */
+			}
 			break;
 		}
 

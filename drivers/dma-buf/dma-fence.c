@@ -15,6 +15,7 @@
 #include <linux/atomic.h>
 #include <linux/dma-fence.h>
 #include <linux/sched/signal.h>
+#include <linux/sched/wake_signal.h>
 #include <linux/seq_file.h>
 
 #define CREATE_TRACE_POINTS
@@ -793,7 +794,7 @@ dma_fence_default_wait_cb(struct dma_fence *fence, struct dma_fence_cb *cb)
 	struct default_wait_cb *wait =
 		container_of(cb, struct default_wait_cb, base);
 
-	wake_up_state(wait->task, TASK_NORMAL);
+	wake_up_state_signal(wait->task, TASK_NORMAL, WF_SCX_FENCE);
 }
 
 /**
