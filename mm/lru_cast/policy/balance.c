@@ -14,9 +14,12 @@
  * administrator sets is: at the share the two are pressed alike, the
  * further over it the harder, and never is a type left alone. A type that
  * will not give, its pages in use, keeps them, and the other gives in its
- * place. Before the curves can compare, the share is the split memory had
- * when reclaim first chose, so that each type pays for its own. On the
- * last pass before OOM (priority 0) it takes from both by their sizes.
+ * place. Anon's part of memory counts what it holds compressed in memory,
+ * in zram or zswap, as well as its pages on the lists: a page swapped to
+ * zram frees only what compressing it saves. Before the curves can
+ * compare, the share is the split memory had when reclaim first chose, so
+ * that each type pays for its own. On the last pass before OOM (priority
+ * 0) it takes from both by their sizes.
  *
  * Three values of swappiness are promises, kept outside the measure:
  *
@@ -60,6 +63,25 @@ static atomic_long_t lru_cast_picks[5];
 
 /* node passes the floor held for */
 static atomic_long_t lru_cast_floor_held;
+
+/*
+ * The pages zsmalloc holds on @pgdat (all nodes, with NULL): anon swapped
+ * to zram or zswap, still in memory, compressed. It is anon's memory as
+ * much as the anon on the lists is.
+ */
+static unsigned long lru_cast_zspages(struct pglist_data *pgdat)
+{
+	unsigned long n = 0;
+#if IS_ENABLED(CONFIG_ZSMALLOC)
+	int z;
+
+	if (!pgdat)
+		return global_zone_page_state(NR_ZSPAGES);
+	for (z = 0; z < MAX_NR_ZONES; z++)
+		n += zone_page_state(&pgdat->node_zones[z], NR_ZSPAGES);
+#endif
+	return n;
+}
 
 static bool lru_cast_has_anon(struct pglist_data *pgdat)
 {
@@ -111,7 +133,7 @@ bool lru_cast_floor_holds(struct pglist_data *pgdat)
 static noinline void lru_cast_hold_share(void)
 {
 	unsigned long anon = global_node_page_state(NR_INACTIVE_ANON) +
-			     global_node_page_state(NR_ACTIVE_ANON);
+			     global_node_page_state(NR_ACTIVE_ANON) + lru_cast_zspages(NULL);
 	unsigned long file = global_node_page_state(NR_INACTIVE_FILE) +
 			     global_node_page_state(NR_ACTIVE_FILE);
 
@@ -120,8 +142,25 @@ static noinline void lru_cast_hold_share(void)
 }
 
 /*
+ * @lruvec's part of its node's compressed anon (@anon on its lists): by its
+ * part of the node's anon -- zram charges no cgroup for what it holds
+ */
+static unsigned long lru_cast_zs_part(struct lruvec *lruvec, unsigned long anon)
+{
+	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
+	unsigned long zs = lru_cast_zspages(pgdat);
+	unsigned long node = node_page_state(pgdat, NR_ACTIVE_ANON) +
+			     node_page_state(pgdat, NR_INACTIVE_ANON);
+
+	if (!zs || !node)
+		return 0;
+	return div64_u64((u64)zs * min(anon, node), node);
+}
+
+/*
  * The pressure on a page of each type, as a swappiness: each type's part of
- * memory over its share, anon's against file's, no further apart than 1:199
+ * memory over its share, anon's against file's, no further apart than 1:199.
+ * Anon's memory is its pages on the lists and those compressed in memory.
  */
 static void lru_cast_pressure(unsigned long anon, unsigned long file, u64 *weight)
 {
@@ -158,7 +197,7 @@ int lru_cast_pick(struct lruvec *lruvec, int swappiness, int priority, bool anon
 		else {	/* both, pressed toward the share */
 			if (unlikely(!lru_cast_param_share_held()))
 				lru_cast_hold_share();
-			lru_cast_pressure(anon, file, weight);
+			lru_cast_pressure(anon + lru_cast_zs_part(lruvec, anon), file, weight);
 			pick = LRU_CAST_BOTH;
 		}
 	} else if (anon_ok) {

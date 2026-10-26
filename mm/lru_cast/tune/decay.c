@@ -22,7 +22,7 @@ void lru_cast_tune_decay_grid(int centre, int *le, int *src)
 	int m;
 
 	for (m = 0; m < LRU_CAST_TUNE_DECAY; m++)
-		le[m] = clamp(centre + lru_cast_tune_off[m], 0, LRU_CAST_LE_MAX);
+		le[m] = clamp(centre + lru_cast_tune_off[m], LRU_CAST_LE_MIN, LRU_CAST_LE_MAX);
 	for (m = LRU_CAST_TUNE_WLO; m < LRU_CAST_TUNE_SIM; m++)
 		le[m] = centre;
 	for (m = 0; m < LRU_CAST_TUNE_SIM; m++)
@@ -37,7 +37,7 @@ void lru_cast_tune_decay_regrid(struct lru_cast_tune_sim *sim, int centre, int *
 	for (m = 0; m < LRU_CAST_TUNE_DECAY; m++) {
 		int best = 0, d, bd = INT_MAX;
 
-		le[m] = clamp(centre + lru_cast_tune_off[m], 0, LRU_CAST_LE_MAX);
+		le[m] = clamp(centre + lru_cast_tune_off[m], LRU_CAST_LE_MIN, LRU_CAST_LE_MAX);
 		for (i = 0; i < LRU_CAST_TUNE_DECAY; i++) {
 			d = abs(lru_cast_tune_sim_le(sim, i) - le[m]);
 			if (d < bd) {

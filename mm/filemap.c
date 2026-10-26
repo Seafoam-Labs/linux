@@ -2627,7 +2627,7 @@ static int filemap_update_page(struct kiocb *iocb,
 	int error;
 
 	if (waits)
-		lru_cast_wait_begin(LRU_CAST_FILE, lru_cast_refaulted(folio));
+		lru_cast_wait_begin_file(lru_cast_refaulted(folio), mapping);
 	error = __filemap_update_page(iocb, mapping, count, folio, need_uptodate);
 	/* not a wait: to be tried again, or waited for by no task */
 	if (waits)
@@ -3606,7 +3606,7 @@ vm_fault_t filemap_fault(struct vm_fault *vmf)
 			filemap_invalidate_lock_shared(mapping);
 			mapping_locked = true;
 			waits = true;
-			lru_cast_wait_begin(LRU_CAST_FILE, lru_cast_refaulted(folio));
+			lru_cast_wait_begin_file(lru_cast_refaulted(folio), mapping);
 		}
 	} else {
 		ret = filemap_fault_recheck_pte_none(vmf);
@@ -3618,7 +3618,7 @@ vm_fault_t filemap_fault(struct vm_fault *vmf)
 		count_memcg_event_mm(vmf->vma->vm_mm, PGMAJFAULT);
 		ret = VM_FAULT_MAJOR;
 		waits = true;
-		lru_cast_wait_begin(LRU_CAST_FILE, false);	/* its refault told once in */
+		lru_cast_wait_begin_file(false, mapping);	/* its refault told once in */
 		fpin = do_sync_mmap_readahead(vmf);
 retry_find:
 		/*

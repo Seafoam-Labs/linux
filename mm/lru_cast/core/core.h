@@ -76,6 +76,14 @@ static inline unsigned long lru_cast_tick(struct pglist_data *pgdat, int type)
 }
 
 /* key.c */
+/*
+ * The weakest decay, H = 128 C: never none. With none a key is the read
+ * count alone, with nothing of when: folios read 255 times or more tie,
+ * and a set read often once stays however long it is not. At le 1 a
+ * folio's reads still count for 8 half-lives of recency at most (log2 255),
+ * and among those read that often the last read decides.
+ */
+#define LRU_CAST_LE_MIN	1
 #define LRU_CAST_LE_MAX	14			/* the steepest decay */
 long lru_cast_key(u32 w, unsigned long tick, int le);
 long lru_cast_key_res(u32 w, unsigned long tick, int le, int res);

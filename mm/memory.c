@@ -4963,8 +4963,8 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 	if (folio)
 		swap_update_readahead(folio, vma, vmf->address);
 	if (!folio) {
-		/* CAST: a wait for the page from swap, ended by the caller */
-		lru_cast_wait_begin(LRU_CAST_ANON, true);
+		/* CAST: the wait for it begins with its read (swap_read_folio()) */
+		lru_cast_wait_swapin(entry.val);
 		/* Swapin bypasses readahead for SWP_SYNCHRONOUS_IO devices */
 		if (data_race(si->flags & SWP_SYNCHRONOUS_IO))
 			folio = swapin_sync(entry, GFP_HIGHUSER_MOVABLE,

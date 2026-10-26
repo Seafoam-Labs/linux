@@ -4,8 +4,8 @@
  *
  *   version      the release
  *   enabled      1 / 0: switch CAST on or off at run time (not if booted off)
- *   decay        le per type, 0..14: half-life C * 2^(8 - le) pages taken in; 0 = no
- *                decay. Writing one sets both and stops decay_auto
+ *   decay        le per type, 1..14: half-life C * 2^(8 - le) pages taken in.
+ *                Writing one sets both and stops decay_auto
  *   decay_auto   1 / 0: the controllers (tune/) set the decay and W's share
  *   tune         the controllers: per type the decay and W's share, and per
  *                simulated cache the misses and disagreements they decide on
@@ -71,7 +71,7 @@ static ssize_t decay_store(struct kobject *kobj, struct kobj_attribute *attr,
 {
 	unsigned int v;
 
-	if (kstrtouint(buf, 0, &v) || v > LRU_CAST_LE_MAX)
+	if (kstrtouint(buf, 0, &v) || v < LRU_CAST_LE_MIN || v > LRU_CAST_LE_MAX)
 		return -EINVAL;
 	lru_cast_tune_set_auto(false);
 	lru_cast_param_set_le(0, v);

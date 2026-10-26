@@ -9,6 +9,17 @@
  * bucket read longest ago (policy/ring.c) -- or, the cache not yet full,
  * joins M. A hit in M moves the page up; a hit in W only updates its state.
  *
+ * Among pages of one key the main cache takes those read once first, in
+ * its clock's order, and those read more than once by a hash, the same of
+ * them first each time (policy/ring.c). So does each cache here: a key's
+ * bucket is LRU_CAST_TUNE_SUB of them, the first for pages read once, read
+ * longest ago first, and the rest for pages read more than once by a hash
+ * of the page, so that a loop over more than the cache keeps the same part
+ * of itself here as it does there -- ranked by when they were read, it
+ * would keep none, and the decay and W's share would be chosen for a
+ * cache that is not the one they set. A newcomer read once meets M's
+ * lowest by its key alone, as there.
+ *
  * The order is every cache size at once. Without W, a CAST cache of any
  * size holds the top of one order of the pages -- by key, at the decay
  * grid's centre, and among equal keys the one read last first: a key
@@ -31,7 +42,8 @@
 #include <linux/vmalloc.h>
 #include "tune/sim.h"
 
-#define LRU_CAST_TUNE_BUCKETS	256
+#define LRU_CAST_TUNE_SUB	4				/* buckets per key */
+#define LRU_CAST_TUNE_BUCKETS	(256 * LRU_CAST_TUNE_SUB)
 #define LRU_CAST_TUNE_HEADS	(LRU_CAST_TUNE_BUCKETS + 1)	/* per cache: the buckets, then W */
 
 struct lru_cast_tune_slot {
@@ -79,10 +91,28 @@ static inline u16 lru_cast_tune_whead(struct lru_cast_tune_sim *sim, int m)
 	return lru_cast_tune_head(sim, m, LRU_CAST_TUNE_BUCKETS);
 }
 
-/* the key of slot @s in cache @m */
+/* the key of @w at decay @le in buckets: its key's, then which of them (see above) */
+static long lru_cast_tune_skey(struct lru_cast_tune_sim *sim, u16 s, int le)
+{
+	u32 w = sim->slot[s].w;
+	long key = lru_cast_key(w, sim->tick, le);
+
+	if (key == LONG_MIN)
+		return LONG_MIN;
+	return key * LRU_CAST_TUNE_SUB +
+	       ((w >> 24) >= 2 ? 1 + hash_64(sim->slot[s].id, 16) % (LRU_CAST_TUNE_SUB - 1) : 0);
+}
+
+/* the bucket of slot @s in cache @m */
 static inline long lru_cast_tune_mkey(struct lru_cast_tune_sim *sim, int m, u16 s)
 {
-	return lru_cast_key(sim->slot[s].w, sim->tick, sim->c[m].le);
+	return lru_cast_tune_skey(sim, s, sim->c[m].le);
+}
+
+/* the lowest bucket the window of cache @m holds now */
+static inline long lru_cast_tune_window_lo(struct lru_cast_tune_sim *sim, int m)
+{
+	return lru_cast_window_lo(sim->tick, sim->c[m].le) * LRU_CAST_TUNE_SUB;
 }
 
 /* ------------------------------------------------------------- lists */
@@ -170,7 +200,7 @@ static void lru_cast_tune_oinsert(struct lru_cast_tune_sim *sim, u16 s, u64 seq)
 	struct lru_cast_tune_slot *sl = &sim->slot[s];
 	struct rb_node **link = &sim->order.rb_node, *parent = NULL;
 
-	sl->key = lru_cast_key(sl->w, sim->tick, sim->ole);
+	sl->key = lru_cast_tune_skey(sim, s, sim->ole);
 	sl->seq = seq;
 	while (*link) {
 		struct lru_cast_tune_slot *p = rb_entry(*link, struct lru_cast_tune_slot, rb);
@@ -225,7 +255,7 @@ static void lru_cast_tune_place(struct lru_cast_tune_sim *sim, int m, u16 s, lon
 static void lru_cast_tune_advance(struct lru_cast_tune_sim *sim, int m)
 {
 	struct lru_cast_tune_cache *c = &sim->c[m];
-	long lo = lru_cast_window_lo(sim->tick, c->le), b, end;
+	long lo = lru_cast_tune_window_lo(sim, m), b, end;
 	u16 to;
 
 	if (lo <= c->lo)
@@ -302,7 +332,10 @@ static void lru_cast_tune_balance(struct lru_cast_tune_sim *sim, int m)
 			continue;
 		}
 		low = lru_cast_tune_lowest(sim, m, &h);
-		if (low == LONG_MAX || bt < low) {
+		/* read once, by its key alone: of one key, the newcomer was read last */
+		if (low == LONG_MAX ||
+		    ((sim->slot[s].w >> 24) >= 2 ? bt < low :
+		     bt / LRU_CAST_TUNE_SUB < low / LRU_CAST_TUNE_SUB)) {
 			lru_cast_tune_evict(sim, m, s);
 			continue;
 		}
@@ -339,17 +372,21 @@ static void lru_cast_tune_access(struct lru_cast_tune_sim *sim, int m, u16 s, bo
 	c->wcount++;
 }
 
-/* a read of @s, resident in the caches of @res, in every cache and in the order: in, or up */
+/*
+ * A read of @s, resident in the caches of @res, in every cache and in the
+ * order: in, or up. Each cache is made to fit on a hit too: a size or a
+ * share set lower (lru_cast_tune_sim_set_cap(), _set_wq()) or a regrid
+ * leaves it over until it is, and a cache over its size that only hits
+ * would never be -- holding more than it may, it misses less than the
+ * others, and the decay it runs at wins.
+ */
 void lru_cast_tune_sim_access_all(struct lru_cast_tune_sim *sim, u16 s, u32 res)
 {
 	int m;
 
 	for (m = 0; m < LRU_CAST_TUNE_SIM; m++) {
-		bool hit = res & BIT(m);
-
-		lru_cast_tune_access(sim, m, s, hit);
-		if (!hit)
-			lru_cast_tune_balance(sim, m);
+		lru_cast_tune_access(sim, m, s, res & BIT(m));
+		lru_cast_tune_balance(sim, m);
 	}
 	if (!RB_EMPTY_NODE(&sim->slot[s].rb))
 		lru_cast_tune_oerase(sim, s);
@@ -511,7 +548,7 @@ void lru_cast_tune_sim_regrid(struct lru_cast_tune_sim *sim, const int *le, cons
 		struct lru_cast_tune_cache *c = &sim->c[m];
 
 		c->le = le[m];
-		c->lo = lru_cast_window_lo(sim->tick, c->le);
+		c->lo = lru_cast_tune_window_lo(sim, m);
 		c->count = c->wcount = 0;
 		bitmap_zero(c->nonempty, LRU_CAST_TUNE_BUCKETS);
 		for (idx = 0; idx < LRU_CAST_TUNE_HEADS; idx++) {
