@@ -827,6 +827,8 @@ struct lru_cast_clock {
 	DECLARE_BITMAP(lids, LRU_CAST_LIDS);
 	/* ... of those, the numbers of lruvecs whose folios went to another's lists */
 	DECLARE_BITMAP(lids_moved, LRU_CAST_LIDS);
+	/* the PFN the marking of stale words reads next, and the tick it has read up to */
+	unsigned long		stale_pfn, stale_tick;
 };
 #endif
 

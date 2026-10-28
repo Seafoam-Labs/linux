@@ -8,7 +8,13 @@
  * and whether it had been read more than once, over the bit that marks it
  * CAST's:
  *
- *	| state word 32 | tick 16 | node NODES_SHIFT | workingset 1 | kind 1 |
+ *	| history H | tick 16 | node NODES_SHIFT | workingset 1 | kind 1 |
+ *
+ * The history, H = LRU_CAST_W_HISTORY_BITS bits, is the state word less its
+ * owner tag (lru_cast_read() gives none, lru_cast_write() keeps the
+ * frame's): its read count over its tick and gaps. An anon shadow is kept
+ * in the swap table, whose top LRU_CAST_SHADOW_ANON_RESERVED bits of the
+ * word are the slot's count and zero flag; the shadow stays below them.
  *
  * The tick wraps after 65536 ticks, 16384 turnovers of the node's memory;
  * a shadow that old comes back as recent, and only then.
@@ -38,14 +44,15 @@
 
 #define LRU_CAST_SHADOW_WS		1
 #define LRU_CAST_SHADOW_TICK	16
-#define LRU_CAST_SHADOW_STATE	32
+#define LRU_CAST_SHADOW_STATE	LRU_CAST_W_HISTORY_BITS
 
 static void *lru_cast_pack(u32 w, u16 tick, int nid, bool workingset)
 {
-	unsigned long v = w;
+	unsigned long v = lru_cast_history_pack(w);
 
 	BUILD_BUG_ON(LRU_CAST_SHADOW_STATE + LRU_CAST_SHADOW_TICK + NODES_SHIFT +
-		     LRU_CAST_SHADOW_WS + LRU_CAST_SHADOW_KIND > BITS_PER_XA_VALUE);
+		     LRU_CAST_SHADOW_WS + LRU_CAST_SHADOW_KIND >
+		     BITS_PER_XA_VALUE - LRU_CAST_SHADOW_ANON_RESERVED);
 	v = (v << LRU_CAST_SHADOW_TICK) | tick;
 	v = (v << NODES_SHIFT) | nid;
 	v = (v << LRU_CAST_SHADOW_WS) | workingset;
@@ -63,7 +70,7 @@ static void lru_cast_unpack(void *shadow, u32 *w, u16 *tick, int *nid, bool *wor
 	v >>= NODES_SHIFT;
 	*tick = v & 0xffff;
 	v >>= LRU_CAST_SHADOW_TICK;
-	*w = v;
+	*w = lru_cast_history_unpack(v);
 }
 
 /* the shadow's history if it is still worth having, else false */

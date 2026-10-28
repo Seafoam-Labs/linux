@@ -23,8 +23,11 @@
  * Pages taken in and freed are counted per CPU and added to the node's
  * count a batch at a time. Whoever paces itself by the clock (the walker,
  * re-protection) is told of each batch by lru_cast_hook_installed(); the clock
- * does not know who.
+ * does not know who. At each tick a part of the node's state words is
+ * looked over, and those read last long ago are marked stale (core.h).
  */
+#include <linux/ktime.h>
+#include <linux/memory_hotplug.h>
 #include <linux/percpu.h>
 #include <linux/sysfs.h>
 #include "core/core.h"
@@ -33,6 +36,13 @@
 
 /* every node's ticks, summed: the controllers' clock */
 static atomic_long_t lru_cast_ticks;
+
+/* words marked stale, and the time it took */
+static atomic_long_t lru_cast_stale_marked;
+static atomic64_t lru_cast_stale_ns;
+
+static void lru_cast_stale_workfn(struct work_struct *work);
+static DECLARE_WORK(lru_cast_stale_work, lru_cast_stale_workfn);
 
 /* a CPU's pages taken in less those freed, not yet added to their node's count */
 struct lru_cast_pending {
@@ -63,7 +73,48 @@ static void lru_cast_clock_add(int nid, long nr)
 	    try_cmpxchg(&c->next, &next, installed + max(size / 4, 1UL))) {
 		WRITE_ONCE(c->tick, c->tick + 1);
 		atomic_long_inc(&lru_cast_ticks);
+		lru_cast_queue_work(&lru_cast_stale_work);
 	}
+}
+
+/*
+ * Each node's words, a part at each tick, marked stale or deep where their
+ * last read is old (core.h): 1/LRU_CAST_STALE_PASS of the node's PFNs for
+ * each tick it has gone on since, all of them at most, so that a word is
+ * read once in LRU_CAST_STALE_PASS ticks, a tick more for the part left at
+ * the end. Marked from LRU_CAST_STALE_AGE ticks on, it is marked well
+ * before its read is 256 ticks old; deep, before its unit wraps.
+ */
+static void lru_cast_stale_workfn(struct work_struct *work)
+{
+	u64 t0 = ktime_get_ns();
+	int nid;
+
+	BUILD_BUG_ON(LRU_CAST_STALE_UNIT <= LRU_CAST_STALE_PASS + 1);	/* a word seen in each unit */
+	if (!lru_cast_enabled())
+		return;
+	get_online_mems();
+	for_each_node_state(nid, N_MEMORY) {
+		struct pglist_data *pgdat = NODE_DATA(nid);
+		struct lru_cast_clock *c = &pgdat->lru_cast_clock;
+		unsigned long tick = READ_ONCE(c->tick);
+		unsigned long start = pgdat->node_start_pfn, end = pgdat_end_pfn(pgdat);
+		unsigned long part = DIV_ROUND_UP(end - start, LRU_CAST_STALE_PASS);
+		unsigned long n = min(tick - c->stale_tick, (unsigned long)LRU_CAST_STALE_PASS);
+
+		c->stale_tick = tick;
+		if (c->stale_pfn < start || c->stale_pfn >= end)
+			c->stale_pfn = start;
+		while (n--) {
+			unsigned long stop = min(end, c->stale_pfn + part);
+
+			atomic_long_add(lru_cast_mark_stale(c->stale_pfn, stop, tick),
+					&lru_cast_stale_marked);
+			c->stale_pfn = stop < end ? stop : start;
+		}
+	}
+	put_online_mems();
+	atomic64_add(ktime_get_ns() - t0, &lru_cast_stale_ns);
 }
 
 /* @nr pages into node @nid, net, on this CPU's account */
@@ -125,5 +176,7 @@ int lru_cast_clock_show(char *buf)
 				     data_race(pgdat->lru_cast_clock.evict),
 				     READ_ONCE(pgdat->lru_cast_clock.tick));
 	}
-	return len;
+	return len + sysfs_emit_at(buf, len, "stale marked %ld us %llu\n",
+				   atomic_long_read(&lru_cast_stale_marked),
+				   atomic64_read(&lru_cast_stale_ns) / 1000);
 }

@@ -107,6 +107,35 @@ unsigned long lru_cast_find_owners(unsigned long pfn, unsigned long end,
 	return end;
 }
 
+/*
+ * The words of [@pfn, @end) old enough at @tick marked stale
+ * (lru_cast_mark()), lock-free: one read meanwhile is left as it is. How
+ * many were marked. It may sleep, a section of words at a time: run by a
+ * worker, it gives way where the kernel is not preemptible.
+ */
+unsigned long lru_cast_mark_stale(unsigned long pfn, unsigned long end, unsigned long tick)
+{
+	unsigned long marked = 0;
+
+	while (pfn < end) {
+		unsigned long sec_end = min(end, section_nr_to_pfn(pfn_to_section_nr(pfn) + 1));
+		u32 *p = lru_cast_word(pfn);
+
+		if (!p) {
+			pfn = sec_end;
+			continue;
+		}
+		for (; pfn < sec_end; pfn++, p++) {
+			u32 v = READ_ONCE(*p), m = lru_cast_mark(v, tick);
+
+			if (m && try_cmpxchg(p, &v, m))
+				marked++;
+		}
+		cond_resched();
+	}
+	return marked;
+}
+
 /* @folio's history made @w; its tag kept */
 void lru_cast_write(struct folio *folio, u32 w)
 {
