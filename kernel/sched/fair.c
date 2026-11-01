@@ -1087,7 +1087,7 @@ static bool update_deadline(struct cfs_rq *cfs_rq, struct sched_entity *se)
 #include "pelt.h"
 #ifdef CONFIG_SMP
 
-static int select_idle_sibling(struct task_struct *p, int prev_cpu, int cpu);
+static int select_idle_sibling(struct task_struct *p, int prev_cpu, int cpu, int sync);
 static unsigned long task_h_load(struct task_struct *p);
 static unsigned long capacity_of(int cpu);
 
@@ -7385,6 +7385,10 @@ out:
 	return ret;
 }
 
+#ifdef CONFIG_SCHED_POC_SELECTOR
+#include "poc_sync.h"
+#endif
+
 /*
  * The dequeue_task method is called before nr_running is
  * decreased. We remove the task from the rbtree and
@@ -7392,6 +7396,10 @@ out:
  */
 static bool dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 {
+#ifdef CONFIG_SCHED_POC_SELECTOR
+	if (flags & DEQUEUE_SLEEP)
+		poc_sync_note_sleep(rq, p);
+#endif
 	if (!(p->se.sched_delayed && (task_on_rq_migrating(p) || (flags & DEQUEUE_SAVE))))
 		util_est_dequeue(&rq->cfs, p);
 
@@ -7838,6 +7846,33 @@ unlock:
 }
 
 /*
+ * Check if the entire core (all SMT siblings) containing @cpu is idle.
+ */
+static inline bool is_idle_core(int cpu)
+{
+	const unsigned long *bits = cpumask_bits(cpu_smt_mask(cpu));
+	unsigned int w;
+
+	/*
+	 * Walk the mask words in place: for_each_cpu() calls find_next_bit()
+	 * for each sibling and once more to find the end, and this runs for
+	 * most wakeups, up to four times.
+	 */
+	for (w = 0; w < BITS_TO_LONGS(nr_cpumask_bits); w++) {
+		unsigned long m = bits[w];
+
+		while (m) {
+			int sibling = w * BITS_PER_LONG + __ffs(m);
+
+			if (!available_idle_cpu(sibling))
+				return false;
+			m &= m - 1;
+		}
+	}
+	return true;
+}
+
+/*
  * Scan the entire LLC domain for idle cores; this dynamically switches off if
  * there are no idle cores left in the system; tracked through
  * sd_llc->shared->has_idle_cores and enabled through update_idle_core() above.
@@ -7902,6 +7937,11 @@ static inline void set_idle_cores(int cpu, int val)
 static inline bool test_idle_cores(int cpu)
 {
 	return false;
+}
+
+static inline bool is_idle_core(int cpu)
+{
+	return (available_idle_cpu(cpu) || sched_idle_cpu(cpu));
 }
 
 static inline int select_idle_core(struct task_struct *p, int core, struct cpumask *cpus, int *idle_cpu)
@@ -8053,15 +8093,54 @@ static inline bool asym_fits_cpu(unsigned long util,
 	return true;
 }
 
+#ifdef CONFIG_SCHED_POC_SELECTOR
+#include "poc_selector.c"
+#endif
 /*
  * Try and locate an idle core/thread in the LLC cache domain.
  */
-static int select_idle_sibling(struct task_struct *p, int prev, int target)
+static int select_idle_sibling(struct task_struct *p, int prev, int target, int sync)
 {
 	bool has_idle_core = false;
 	struct sched_domain *sd;
 	unsigned long task_util, util_min, util_max;
 	int i, recent_used_cpu, prev_aff = -1;
+
+	/* Check a recently used CPU as a potential idle candidate: */
+	recent_used_cpu = p->recent_used_cpu;
+	p->recent_used_cpu = prev;
+	if (recent_used_cpu != prev &&
+	    recent_used_cpu != target &&
+	    cpus_share_cache(recent_used_cpu, target) &&
+	    (available_idle_cpu(recent_used_cpu) || sched_idle_cpu(recent_used_cpu)) &&
+	    cpumask_test_cpu(recent_used_cpu, p->cpus_ptr)) {
+#ifdef CONFIG_SCHED_POC_SELECTOR
+		if (poc_sync_recent_ok())
+#endif
+		if ((unsigned int)recent_used_cpu < nr_cpumask_bits &&
+		    is_idle_core(recent_used_cpu)) {
+			/*
+			 * recent_used_cpu is the CPU the task ran on before
+			 * prev.  Never prefer it over an idle prev core, or a
+			 * task that wakes on an idle machine ping-pongs between
+			 * the two, paying a cold core on every wakeup.
+			 */
+			int cpu = recent_used_cpu;
+
+			if (cpumask_test_cpu(prev, p->cpus_ptr) &&
+			    cpus_share_cache(prev, target) && is_idle_core(prev))
+				cpu = prev;
+#ifdef CONFIG_SCHED_POC_SELECTOR
+			if (static_branch_likely(&poc_selector_active)) {
+				poc_count(cpu == prev ? POC_LV1P : POC_LV1R);
+				poc_commit_cpu(cpu);
+			}
+#endif
+			return cpu;
+		}
+	} else {
+		recent_used_cpu = -1;
+	}
 
 	/*
 	 * On asymmetric system, update task utilization because we will check
@@ -8079,23 +8158,15 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
 	 */
 	lockdep_assert_irqs_disabled();
 
-	if ((available_idle_cpu(target) || sched_idle_cpu(target)) &&
-	    asym_fits_cpu(task_util, util_min, util_max, target))
+#ifdef CONFIG_SCHED_POC_SELECTOR
+	if (static_branch_likely(&poc_selector_active) &&
+	    is_idle_core(target) &&
+	    asym_fits_cpu(task_util, util_min, util_max, target)) {
+		poc_count(POC_LV1T);
+		poc_commit_cpu(target);
 		return target;
-
-	/*
-	 * If the previous CPU is cache affine and idle, don't be stupid:
-	 */
-	if (prev != target && cpus_share_cache(prev, target) &&
-	    (available_idle_cpu(prev) || sched_idle_cpu(prev)) &&
-	    asym_fits_cpu(task_util, util_min, util_max, prev)) {
-
-		if (!static_branch_unlikely(&sched_cluster_active) ||
-		    cpus_share_resources(prev, target))
-			return prev;
-
-		prev_aff = prev;
 	}
+#endif
 
 	/*
 	 * Allow a per-cpu kthread to stack with the wakee if the
@@ -8111,24 +8182,6 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
 	    this_rq()->nr_running <= 1 &&
 	    asym_fits_cpu(task_util, util_min, util_max, prev)) {
 		return prev;
-	}
-
-	/* Check a recently used CPU as a potential idle candidate: */
-	recent_used_cpu = p->recent_used_cpu;
-	p->recent_used_cpu = prev;
-	if (recent_used_cpu != prev &&
-	    recent_used_cpu != target &&
-	    cpus_share_cache(recent_used_cpu, target) &&
-	    (available_idle_cpu(recent_used_cpu) || sched_idle_cpu(recent_used_cpu)) &&
-	    cpumask_test_cpu(recent_used_cpu, p->cpus_ptr) &&
-	    asym_fits_cpu(task_util, util_min, util_max, recent_used_cpu)) {
-
-		if (!static_branch_unlikely(&sched_cluster_active) ||
-		    cpus_share_resources(recent_used_cpu, target))
-			return recent_used_cpu;
-
-	} else {
-		recent_used_cpu = -1;
 	}
 
 	/*
@@ -8155,6 +8208,46 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
 	if (!sd)
 		return target;
 
+#ifdef CONFIG_SCHED_POC_SELECTOR
+	{
+		int poc_cpu = poc_select_idle_sibling(p, prev, target,
+						      recent_used_cpu);
+
+		if (likely(poc_cpu >= 0))
+			return poc_cpu;
+		if (unlikely(poc_cpu == -2))
+			goto give_up;
+	}
+#endif
+
+	if ((unsigned int)recent_used_cpu < nr_cpumask_bits) {
+		if ((available_idle_cpu(recent_used_cpu) || sched_idle_cpu(recent_used_cpu))) {
+			if (is_idle_core(recent_used_cpu))
+				return recent_used_cpu;
+			/* idle CPU but not idle core → preserve for give_up */
+		} else {
+			recent_used_cpu = -1;  /* not idle → discard */
+		}
+	}
+
+	if (sync && is_idle_core(target) &&
+	    asym_fits_cpu(task_util, util_min, util_max, target))
+		return target;
+
+	/*
+	 * If the previous CPU is cache affine and idle, don't be stupid:
+	 */
+	if (prev != target && cpus_share_cache(prev, target) &&
+	    (available_idle_cpu(prev) || sched_idle_cpu(prev)) &&
+	    asym_fits_cpu(task_util, util_min, util_max, prev)) {
+
+		if (!static_branch_unlikely(&sched_cluster_active) ||
+		    cpus_share_resources(prev, target))
+			return prev;
+
+		prev_aff = prev;
+	}
+
 	if (sched_smt_active()) {
 		has_idle_core = test_idle_cores(target);
 
@@ -8169,6 +8262,9 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
 	if ((unsigned)i < nr_cpumask_bits)
 		return i;
 
+#ifdef CONFIG_SCHED_POC_SELECTOR
+give_up:
+#endif
 	/*
 	 * For cluster machines which have lower sharing cache like L2 or
 	 * LLC Tag, we tend to find an idle CPU in the target's cluster
@@ -8180,6 +8276,9 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
 	if ((unsigned int)recent_used_cpu < nr_cpumask_bits)
 		return recent_used_cpu;
 
+#ifdef CONFIG_SCHED_POC_SELECTOR
+	target = poc_last_resort(prev, target);
+#endif
 	return target;
 }
 
@@ -8871,7 +8970,12 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
 		new_cpu = sched_balance_find_dst_cpu(sd, p, cpu, prev_cpu, sd_flag);
 	} else if (wake_flags & WF_TTWU) { /* XXX always ? */
 		/* Fast path */
-		new_cpu = select_idle_sibling(p, prev_cpu, new_cpu);
+#ifdef CONFIG_SCHED_POC_SELECTOR
+		if (static_branch_likely(&poc_selector_active))
+			new_cpu = poc_select_wake_cpu(p, prev_cpu, new_cpu, sync);
+		else
+#endif
+		new_cpu = select_idle_sibling(p, prev_cpu, new_cpu, sync);
 	}
 	rcu_read_unlock();
 
@@ -8991,6 +9095,10 @@ static void check_preempt_wakeup_fair(struct rq *rq, struct task_struct *p, int 
 	struct cfs_rq *cfs_rq = task_cfs_rq(curr);
 	int cse_is_idle, pse_is_idle;
 
+#ifdef CONFIG_SCHED_POC_SELECTOR
+	if (poc_sync_wakee_waits(rq, curr, p, wake_flags))
+		return;
+#endif
 	if (unlikely(se == pse))
 		return;
 
