@@ -80,8 +80,39 @@ struct sched_group;
 struct sched_domain_shared {
 	atomic_t	ref;
 	atomic_t	nr_busy_cpus;
-	int		has_idle_cores;
-	int		nr_idle_scan;
+	int			has_idle_cores;
+	int			nr_idle_scan;
+#ifdef CONFIG_SCHED_POC_SELECTOR
+	/*
+	 * POC Selector: per-LLC idle CPU tracking
+	 */
+	u64		poc_llc_members;	/* bitmask of valid CPUs (relative to base) */
+	int		poc_cpu_base;		/* smallest CPU ID in this LLC */
+	u8		poc_affinity_shift;	/* bit shift for cpumask alignment */
+	bool	poc_fast_eligible;	/* true when LLC CPU count <= 64 */
+	bool	poc_cluster_valid;	/* true when cluster mask is usable */
+#ifdef CONFIG_SCHED_SMT
+	u8		poc_smt_shift;		/* bit distance between SMT siblings */
+	u64		poc_primary_mask;	/* bitmask of core representative CPUs */
+#endif
+
+	/*
+	 * Lazy commit: reader-facing busy mask + pending bits.
+	 * Readers: single atomic64_read (MOV on x86); idle = ~busy.
+	 * Writers: atomic_or / atomic64_set on the shared cacheline.
+	 */
+	atomic64_t	poc_busy_mask ____cacheline_aligned;
+	atomic64_t	poc_pending ____cacheline_aligned;	/* one bit per LLC CPU */
+
+	/*
+	 * Read-only lookup tables (written once at init).
+	 * Cacheline-aligned for exact prefetch targeting.
+	 */
+	u64		poc_cluster_mask[64] ____cacheline_aligned;
+#ifdef CONFIG_SCHED_SMT
+	u64		poc_smt_mask[64] ____cacheline_aligned;
+#endif /* CONFIG_SCHED_SMT */
+#endif /* CONFIG_SCHED_POC_SELECTOR */
 };
 
 struct sched_domain {
