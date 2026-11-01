@@ -4833,6 +4833,9 @@ static void scx_ops_disable_workfn(struct kthread_work *work)
 
 	WARN_ON_ONCE(scx_ops_set_enable_state(SCX_OPS_DISABLED) !=
 		     SCX_OPS_DISABLING);
+#ifdef CONFIG_SCHED_POC_SELECTOR
+	poc_notify_scx(false);
+#endif
 done:
 	scx_ops_bypass(false);
 }
@@ -5522,6 +5525,10 @@ static void scx_ops_enable_workfn(struct kthread_work *work)
 
 	if (!(ops->flags & SCX_OPS_SWITCH_PARTIAL))
 		static_branch_enable(&__scx_switched_all);
+
+#ifdef CONFIG_SCHED_POC_SELECTOR
+	poc_notify_scx(true);
+#endif
 
 	pr_info("sched_ext: BPF scheduler \"%s\" enabled%s\n",
 		scx_ops.name, scx_switched_all() ? "" : " (partial)");
