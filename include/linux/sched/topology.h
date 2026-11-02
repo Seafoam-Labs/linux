@@ -106,7 +106,7 @@ struct sched_domain_shared {
 	 * Writers: atomic_or / atomic64_set on the shared cacheline.
 	 */
 	atomic64_t	poc_busy_mask ____cacheline_aligned;
-	atomic_t	poc_pending[8] ____cacheline_aligned;	/* 8 chunks x 8 LLC CPUs */
+	atomic64_t	poc_pending ____cacheline_aligned;	/* one bit per LLC CPU */
 
 	/*
 	 * Read-only lookup tables (written once at init).
