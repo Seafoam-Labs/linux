@@ -29,6 +29,7 @@
 #include <linux/ktime.h>
 #include <linux/memory_hotplug.h>
 #include <linux/percpu.h>
+#include <linux/swap.h>
 #include <linux/sysfs.h>
 #include "core/core.h"
 
@@ -71,6 +72,12 @@ static void lru_cast_clock_add(int nid, long nr)
 	lru_cast_hook_installed(nr, size);
 	if (installed >= (long)next &&
 	    try_cmpxchg(&c->next, &next, installed + max(size / 4, 1UL))) {
+		int type;
+
+		for (type = 0; type < ANON_AND_FILE; type++) {
+			data_race(c->shadowed[type] -= c->shadowed[type] / 4);
+			data_race(c->returned[type] -= c->returned[type] / 4);
+		}
 		WRITE_ONCE(c->tick, c->tick + 1);
 		atomic_long_inc(&lru_cast_ticks);
 		lru_cast_queue_work(&lru_cast_stale_work);
@@ -159,6 +166,37 @@ void lru_cast_evicted(struct pglist_data *pgdat, int type, unsigned long nr)
 	lru_cast_clock_count(pgdat->node_id, nr);
 }
 
+/* @nr pages of @type evicted from @pgdat with a shadow */
+void lru_cast_shadowed(struct pglist_data *pgdat, int type, unsigned long nr)
+{
+	data_race(pgdat->lru_cast_clock.shadowed[type] += nr);
+}
+
+/* @nr pages of @type faulted back into @pgdat within the ghosts' window */
+void lru_cast_returned(struct pglist_data *pgdat, int type, unsigned long nr)
+{
+	data_race(pgdat->lru_cast_clock.returned[type] += nr);
+}
+
+/*
+ * Too many of a type's pages isolated for a direct reclaimer to take
+ * more (lru_cast.h): of the pages in flight, those that will come back,
+ * the share r of evictions faulted back within the ghosts' window, would
+ * be more than a batch; an eighth of one for a caller that may do IO and
+ * FS, as upstream gives GFP_NOIO and GFP_NOFS callers eight times the
+ * room. Isolated * r > batch, without the division.
+ */
+bool lru_cast_too_many_isolated(struct pglist_data *pgdat, int type, unsigned long isolated,
+				bool io_fs)
+{
+	struct lru_cast_clock *c = &pgdat->lru_cast_clock;
+	unsigned long out = data_race(c->shadowed[type]);
+	unsigned long back = min(data_race(c->returned[type]), out);
+	unsigned long batch = io_fs ? SWAP_CLUSTER_MAX / 8 : SWAP_CLUSTER_MAX;
+
+	return isolated * back > batch * out;
+}
+
 unsigned long lru_cast_ticks_now(void)
 {
 	return atomic_long_read(&lru_cast_ticks);
@@ -171,10 +209,14 @@ int lru_cast_clock_show(char *buf)
 	for_each_node_state(nid, N_MEMORY) {
 		struct pglist_data *pgdat = NODE_DATA(nid);
 
+		struct lru_cast_clock *c = &pgdat->lru_cast_clock;
+
 		len += sysfs_emit_at(buf, len, "node%d installed %ld evicted %lu tick %lu\n", nid,
-				     atomic_long_read(&pgdat->lru_cast_clock.installed),
-				     data_race(pgdat->lru_cast_clock.evict),
-				     READ_ONCE(pgdat->lru_cast_clock.tick));
+				     atomic_long_read(&c->installed), data_race(c->evict),
+				     READ_ONCE(c->tick));
+		len += sysfs_emit_at(buf, len, "node%d returned anon %lu/%lu file %lu/%lu\n", nid,
+				     data_race(c->returned[0]), data_race(c->shadowed[0]),
+				     data_race(c->returned[1]), data_race(c->shadowed[1]));
 	}
 	return len + sysfs_emit_at(buf, len, "stale marked %ld us %llu\n",
 				   atomic_long_read(&lru_cast_stale_marked),

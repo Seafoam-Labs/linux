@@ -73,8 +73,8 @@ static void lru_cast_unpack(void *shadow, u32 *w, u16 *tick, int *nid, bool *wor
 	*w = lru_cast_history_unpack(v);
 }
 
-/* the shadow's history if it is still worth having, else false */
-static bool lru_cast_ghost(void *shadow, int nid, int type, u32 *w, bool *workingset)
+/* the shadow is CAST's, left on this node within the ghosts' window: its history read out */
+static bool lru_cast_ghost_recent(void *shadow, int nid, int type, u32 *w, bool *workingset)
 {
 	u16 tick;
 	int snid;
@@ -83,18 +83,25 @@ static bool lru_cast_ghost(void *shadow, int nid, int type, u32 *w, bool *workin
 	if (!lru_cast_shadow(shadow))
 		return false;
 	lru_cast_unpack(shadow, w, &tick, &snid, workingset);
-	if (snid != nid || !node_online(snid) || !(*w >> 24))
+	if (snid != nid || !node_online(snid))
 		return false;
 	return (u16)(lru_cast_tick(NODE_DATA(snid), type) - tick) <= LRU_CAST_GHOST_TICKS;
+}
+
+/* the shadow's history if it is still worth having, else false */
+static bool lru_cast_ghost(void *shadow, int nid, int type, u32 *w, bool *workingset)
+{
+	return lru_cast_ghost_recent(shadow, nid, type, w, workingset) && (*w >> 24);
 }
 
 void *lru_cast_eviction(struct folio *folio)
 {
 	struct pglist_data *pgdat = folio_pgdat(folio);
+	int type = folio_is_file_lru(folio);
 	u32 w = lru_cast_read(folio);
 
-	return lru_cast_pack(w, lru_cast_tick(pgdat, folio_is_file_lru(folio)), pgdat->node_id,
-			  (w >> 24) > 1);
+	lru_cast_shadowed(pgdat, type, folio_nr_pages(folio));
+	return lru_cast_pack(w, lru_cast_tick(pgdat, type), pgdat->node_id, (w >> 24) > 1);
 }
 
 bool lru_cast_test_recent(void *shadow, bool file, bool *workingset)
@@ -118,7 +125,10 @@ void lru_cast_refault(struct folio *folio, void *shadow)
 	rcu_read_lock();
 	lruvec = folio_lruvec(folio);
 	mod_lruvec_state(lruvec, WORKINGSET_REFAULT_BASE + type, nr);
-	if (!lru_cast_ghost(shadow, folio_nid(folio), type, &w, &workingset))
+	if (!lru_cast_ghost_recent(shadow, folio_nid(folio), type, &w, &workingset))
+		goto out;
+	lru_cast_returned(folio_pgdat(folio), type, nr);	/* the eviction undone */
+	if (!(w >> 24))
 		goto out;
 
 	/*

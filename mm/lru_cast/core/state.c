@@ -21,6 +21,7 @@
  */
 #include "core/core.h"
 #include "core/store.h"
+#include "core/inl.h"
 
 u32 lru_cast_read(struct folio *folio)
 {
@@ -52,31 +53,10 @@ u32 lru_cast_set_owner(struct folio *folio, u32 owner)
 	return (old & LRU_CAST_OWNER_MASK) >> LRU_CAST_W_OWNER;
 }
 
-/*
- * The first PFN in [@pfn, @end) whose owner tag is @owner, its state word
- * in *@w; @end if there is none. A section without words is passed over.
- */
+/* the out-of-line form of lru_cast_find_owner_inl() (core/inl.h) */
 unsigned long lru_cast_find_owner(unsigned long pfn, unsigned long end, u32 owner, u32 *w)
 {
-	owner <<= LRU_CAST_W_OWNER;
-	while (pfn < end) {
-		unsigned long sec_end = min(end, section_nr_to_pfn(pfn_to_section_nr(pfn) + 1));
-		u32 *p = lru_cast_word(pfn);
-
-		if (!p) {
-			pfn = sec_end;
-			continue;
-		}
-		for (; pfn < sec_end; pfn++, p++) {
-			u32 v = READ_ONCE(*p);
-
-			if ((v & LRU_CAST_OWNER_MASK) == owner) {
-				*w = v & ~LRU_CAST_OWNER_MASK;
-				return pfn;
-			}
-		}
-	}
-	return end;
+	return lru_cast_find_owner_inl(pfn, end, owner, w);
 }
 
 /*

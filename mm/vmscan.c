@@ -1934,9 +1934,10 @@ bool folio_isolate_lru(struct folio *folio)
  * the LRU list will go small and be scanned faster than necessary, leading to
  * unnecessary swapping, thrashing and OOM.
  */
-static bool too_many_isolated(struct pglist_data *pgdat, int file,
+static bool too_many_isolated(struct lruvec *lruvec, int file,
 		struct scan_control *sc)
 {
+	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
 	unsigned long inactive, isolated;
 	bool too_many;
 
@@ -1953,6 +1954,12 @@ static bool too_many_isolated(struct pglist_data *pgdat, int file,
 		inactive = node_page_state(pgdat, NR_INACTIVE_ANON);
 		isolated = node_page_state(pgdat, NR_ISOLATED_ANON);
 	}
+	/* CAST weighs the pages in flight by how many will come back (lru_cast.h) */
+	if (lru_cast_on(lruvec)) {
+		too_many = lru_cast_too_many_isolated(pgdat, file, isolated,
+						      gfp_has_io_fs(sc->gfp_mask));
+		goto out;
+	}
 
 	/*
 	 * GFP_NOIO/GFP_NOFS callers are allowed to isolate more pages, so they
@@ -1963,7 +1970,7 @@ static bool too_many_isolated(struct pglist_data *pgdat, int file,
 		inactive >>= 3;
 
 	too_many = isolated > inactive;
-
+out:
 	/* Wake up tasks throttled due to too_many_isolated. */
 	if (!too_many)
 		wake_throttle_isolated(pgdat);
@@ -2109,7 +2116,7 @@ static unsigned long shrink_inactive_list(unsigned long nr_to_scan,
 	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
 	bool stalled = false;
 
-	while (unlikely(too_many_isolated(pgdat, file, sc))) {
+	while (unlikely(too_many_isolated(lruvec, file, sc))) {
 		if (stalled)
 			return 0;
 

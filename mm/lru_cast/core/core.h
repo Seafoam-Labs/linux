@@ -183,6 +183,8 @@ unsigned long lru_cast_mark_stale(unsigned long pfn, unsigned long end, unsigned
 /* clock.c */
 void lru_cast_installed(struct folio *folio, unsigned long nr);
 void lru_cast_released(int nid, unsigned long nr);
+void lru_cast_shadowed(struct pglist_data *pgdat, int type, unsigned long nr);
+void lru_cast_returned(struct pglist_data *pgdat, int type, unsigned long nr);
 unsigned long lru_cast_ticks_now(void);		/* every node's ticks, summed */
 int lru_cast_clock_show(char *buf);
 
