@@ -52,7 +52,7 @@
 #define SCHED_POC_SELECTOR_AUTHOR   "Masahito Suzuki"
 #define SCHED_POC_SELECTOR_PROGNAME "Piece-Of-Cake (POC) CPU Selector"
 
-#define SCHED_POC_SELECTOR_VERSION  "3.0.0"
+#define SCHED_POC_SELECTOR_VERSION  "3.0.1"
 
 /**************************************************************
  * Static keys:
@@ -586,30 +586,24 @@ static noinline void poc_aggregate_pull(struct sched_domain_shared *sd_share)
 	unsigned int head = 0, tail = 0;
 	u8 ring[64];
 	u64 busy = 0;
-	int i;
+	u64 s;
 
-	for (i = 0; i < 8; i++) {
-		unsigned int s;
+	s = (u64)atomic64_xchg(&sd_share->poc_pending, 0);
+	if (s)
+		busy = (u64)atomic64_read(&sd_share->poc_busy_mask);
+	while (s) {
+		int b = __ffs64(s);
+		int cpu = base + b;
 
-		if (!atomic_read(&sd_share->poc_pending[i]))
+		s &= s - 1;
+		if (cpu >= nr_cpu_ids || !cpu_online(cpu))
 			continue;
-		s = (unsigned int)atomic_xchg(&sd_share->poc_pending[i], 0);
-		if (!head)
-			busy = (u64)atomic64_read(&sd_share->poc_busy_mask);
-		while (s) {
-			int b = (i * 8) + __ffs(s);
-			int cpu = base + b;
-
-			s &= s - 1;
-			if (cpu >= nr_cpu_ids || !cpu_online(cpu))
-				continue;
-			prefetch(&cpu_rq(cpu)->poc_busy_bit);
-			ring[head++] = b;
-			if (head - tail > budget) {
-				b = ring[tail++];
-				busy &= ~(1ULL << b);
-				busy |= READ_ONCE(cpu_rq(base + b)->poc_busy_bit);
-			}
+		prefetch(&cpu_rq(cpu)->poc_busy_bit);
+		ring[head++] = b;
+		if (head - tail > budget) {
+			b = ring[tail++];
+			busy &= ~(1ULL << b);
+			busy |= READ_ONCE(cpu_rq(base + b)->poc_busy_bit);
 		}
 	}
 	if (!head)
@@ -627,12 +621,7 @@ static noinline void poc_aggregate_pull(struct sched_domain_shared *sd_share)
 /* nothing pending is the common case: check without a stack frame */
 void poc_aggregate(struct sched_domain_shared *sd_share)
 {
-	unsigned int any = 0;
-	int i;
-
-	for (i = 0; i < 8; i++)
-		any |= (unsigned int)atomic_read(&sd_share->poc_pending[i]);
-	if (any)
+	if (atomic64_read(&sd_share->poc_pending))
 		poc_aggregate_pull(sd_share);
 }
 /*
@@ -675,7 +664,15 @@ void __set_cpu_idle_state_poc(int cpu, int state)
 	 */
 	if (!!((u64)atomic64_read(&sd_share->poc_busy_mask) & bm) == !state)
 		return;
-	atomic_or(1 << (bit & 7), &sd_share->poc_pending[bit >> 3]);
+	/*
+	 * poc_aggregate_pull() reads rq->poc_busy_bit after its fully
+	 * ordered xchg took this bit, but atomic64_or() alone is not ordered
+	 * after the store above: on a weakly ordered CPU the bit could be
+	 * seen first and the stale state be pulled into the busy mask.
+	 * Costs nothing on x86.
+	 */
+	smp_wmb();
+	atomic64_or(1ULL << (bit & 63), &sd_share->poc_pending);
 }
 /**************************************************************
  * Idle CPU selection helpers:
@@ -901,8 +898,8 @@ static __always_inline void poc_commit_selection(int cpu,
 		 * still-idle local bit and undoes the commit before the wakee
 		 * gets to run, letting the rest of the burst stack on it.
 		 */
-		if (atomic_read(&sd_share->poc_pending[bit >> 3]) & (1 << (bit & 7)))
-			atomic_and(~(1 << (bit & 7)), &sd_share->poc_pending[bit >> 3]);
+		if (atomic64_read(&sd_share->poc_pending) & (1ULL << bit))
+			atomic64_andnot(1ULL << bit, &sd_share->poc_pending);
 		smp_mb__after_atomic();
 		WRITE_ONCE(cpu_rq(cpu)->poc_idle_committed, 1);
 	}
@@ -1288,8 +1285,7 @@ void poc_sd_shared_init(struct sched_domain *sd, int sd_id)
 			}
 			atomic64_set(&sd->shared->poc_busy_mask, busy);
 		}
-		for (int pi = 0; pi < 8; pi++)
-			atomic_set(&sd->shared->poc_pending[pi], 0);
+		atomic64_set(&sd->shared->poc_pending, 0);
 	}
 
 #ifdef CONFIG_SCHED_SMT
@@ -1508,8 +1504,7 @@ static void poc_rebuild_all_llcs_busy(void)
 			members &= members - 1;
 		}
 		atomic64_set(&sd_share->poc_busy_mask, busy);
-		for (int pi = 0; pi < 8; pi++)
-			atomic_set(&sd_share->poc_pending[pi], 0);
+		atomic64_set(&sd_share->poc_pending, 0);
 	}
 }
 

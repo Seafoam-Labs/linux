@@ -8861,11 +8861,24 @@ unlock:
  */
 static inline bool is_idle_core(int cpu)
 {
-	int sibling;
+	const unsigned long *bits = cpumask_bits(cpu_smt_mask(cpu));
+	unsigned int w;
 
-	for_each_cpu(sibling, cpu_smt_mask(cpu)) {
-		if (!available_idle_cpu(sibling))
-			return false;
+	/*
+	 * Walk the mask words in place: for_each_cpu() calls find_next_bit()
+	 * for each sibling and once more to find the end, and this runs for
+	 * most wakeups, up to four times.
+	 */
+	for (w = 0; w < BITS_TO_LONGS(nr_cpumask_bits); w++) {
+		unsigned long m = bits[w];
+
+		while (m) {
+			int sibling = w * BITS_PER_LONG + __ffs(m);
+
+			if (!available_idle_cpu(sibling))
+				return false;
+			m &= m - 1;
+		}
 	}
 	return true;
 }
