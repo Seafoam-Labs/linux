@@ -126,6 +126,19 @@ unsigned long lru_cast_isolate(struct lruvec *lruvec, struct lru_cast_scan *s,
 		scan += nr_pages;
 		if (!folio_test_lru(folio) || (!s->may_unmap && folio_mapped(folio)))
 			goto aside;
+		/*
+		 * Pinned for a device (FOLL_LONGTERM: CUDA, io_uring, RDMA): the
+		 * unmap fails, and the folio would go back to M under the same
+		 * key, still the lowest, for reclaim to take again -- the CPU
+		 * does not read it, so nothing lifts it. Lift it, as program
+		 * text in use is: it is in use, and a victim must be one that
+		 * can go. (How much of a type is pinned, lru_cast_pick() reads
+		 * off the node's pin counts.)
+		 */
+		if (unlikely(folio_maybe_dma_pinned(folio))) {
+			lru_cast_access_kept(folio);
+			goto aside;
+		}
 		if (unlikely(!folio_try_get(folio)))
 			goto aside;
 		if (!folio_test_clear_lru(folio)) {
