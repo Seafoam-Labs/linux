@@ -11,7 +11,7 @@
 #define SCHED_BORE_AUTHOR   "Masahito Suzuki"
 #define SCHED_BORE_PROGNAME "BORE CPU Scheduler modification"
 
-#define SCHED_BORE_VERSION  "7.0.0"
+#define SCHED_BORE_VERSION  "7.0.1"
 
 extern u8   __read_mostly sched_bore;
 DECLARE_STATIC_KEY_TRUE(sched_bore_key);

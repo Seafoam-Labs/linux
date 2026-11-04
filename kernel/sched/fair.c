@@ -5487,8 +5487,12 @@ vslice_found:
 	    entity_is_task(se) && (flags & ENQUEUE_WAKEUP)) {
 		u64 credit = bore_credit_ns(task_of(se));
 
-		if (credit && se->deadline > credit)
-			se->deadline -= credit;
+		if (credit) {
+			u64 vcredit = calc_delta_fair(credit, se);
+
+			if (se->deadline > vcredit)
+				se->deadline -= vcredit;
+		}
 	}
 #endif /* CONFIG_SCHED_BORE */
 }
