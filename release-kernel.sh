@@ -7,7 +7,7 @@
 #   ./release-kernel.sh --dev 7.2.3         -> devario-dev-7.2.3-1
 #   ./release-kernel.sh --scx 7.2.3         -> devario-scx-7.2.3-1
 #   ./release-kernel.sh --gaming 7.3.1      -> devario-gaming-7.3.1-1
-#   ./release-kernel.sh --internal 7.3.1    -> devario-internal-7.3.1-1 (tag only)
+#   ./release-kernel.sh --internal 7.3.1    -> devario-internal-7.3.1-1
 #   ./release-kernel.sh --dry-run 6.19-rc8
 
 set -euo pipefail
@@ -18,8 +18,7 @@ readonly SCRIPT_NAME=${0##*/}
 readonly EXPECTED_REPO_SLUG=${RELEASE_REPO_SLUG:-Seafoam-Labs/linux}
 # Release channel: "" (stable), "dev", "scx", "gaming" or "internal"; set by
 # --dev / --scx / --gaming / --internal. Selects the tag prefix
-# (devario[-<channel>]) and the release title. The internal channel never
-# gets a GitHub release or tarball - its tags are at most pushed to origin.
+# (devario[-<channel>]) and the release title.
 CHANNEL=""
 TAG_PREFIX="devario"
 RELEASE_TITLE="Devario Linux"
@@ -84,9 +83,8 @@ Options:
   -g, --gaming     Gaming channel: tag devario-gaming-<version>-<pkgrel>,
                    release titled "Devario Linux (gaming) <version>-<pkgrel>";
                    a full release, but never marked "latest" on GitHub
-  -i, --internal   Internal channel: tag devario-internal-<version>-<pkgrel>.
-                   Signed tag only - no tarball, no GitHub release; the tag
-                   can optionally be pushed to origin
+  -i, --internal   Internal channel: tag devario-internal-<version>-<pkgrel>,
+                   pre-release titled "Devario Linux (internal) <version>-<pkgrel>"
                    (--dev, --scx, --gaming and --internal are mutually
                    exclusive)
   -n, --dry-run    Only print the generated changelog, change nothing
@@ -111,15 +109,15 @@ Checks performed before tagging (all fatal):
 
 Publishing:
   - only to ${EXPECTED_REPO_SLUG} (origin must point there)
-  - dev/scx channels and -rc versions are created as GitHub pre-releases
+  - dev/scx/internal channels and -rc versions are created as GitHub
+    pre-releases
   - gaming releases are full releases with --latest=false, so the stable
     channel stays the "latest" release
-  - internal tags never get a GitHub release; --resume only pushes the tag
 
 Recovering a half-finished publish:
   If the script fails after the tag was created (push, signing or
   'gh release' error), fix the cause and re-run with --resume:
-      ${SCRIPT_NAME} [--dev|--scx] --resume <kernel-version> [pkgrel]
+      ${SCRIPT_NAME} [--dev|--scx|--gaming|--internal] --resume <kernel-version> [pkgrel]
 
 Requirements:
   - A GPG key configured via 'git config user.signingkey' for the tag.
@@ -175,16 +173,14 @@ if [[ -n $CHANNEL ]]; then
     RELEASE_TITLE="Devario Linux (${CHANNEL})"
 fi
 readonly CHANNEL TAG_PREFIX RELEASE_TITLE
-# Only stable, non-rc releases are "latest" on GitHub. dev/scx and -rc are
-# pre-releases; gaming is a full release that is never marked latest.
+# Only stable, non-rc releases are "latest" on GitHub. dev/scx/internal and
+# -rc are pre-releases; gaming is a full release that is never marked latest.
 PRERELEASE=''
-[[ $CHANNEL == dev || $CHANNEL == scx || $VERSION == *-rc* ]] && PRERELEASE=1
+[[ $CHANNEL == dev || $CHANNEL == scx || $CHANNEL == internal || $VERSION == *-rc* ]] \
+    && PRERELEASE=1
 NOT_LATEST=''
 [[ $CHANNEL == gaming ]] && NOT_LATEST=1
-# Internal tags never get a GitHub release or tarball.
-INTERNAL=''
-[[ $CHANNEL == internal ]] && INTERNAL=1
-readonly PRERELEASE NOT_LATEST INTERNAL
+readonly PRERELEASE NOT_LATEST
 
 [[ -n $VERSION ]] || { usage >&2; exit 1; }
 [[ $VERSION =~ ^[0-9]+\.[0-9]+(\.[0-9]+|-rc[0-9]+)$ ]] \
@@ -493,14 +489,6 @@ push_tag() {
     fi
 }
 
-# Internal channel: the signed tag is the whole release. No tarball, no
-# GitHub release - only a push to origin.
-publish_internal() {
-    origin_slug >/dev/null
-    push_tag
-    ok "internal tag ${TAG} pushed (no GitHub release)"
-}
-
 # Idempotent: every step is safe to repeat, so --resume can re-run it.
 # Artifacts are built in a fresh temporary directory (never next to the
 # checkout, never reusing leftovers), and local work happens before anything
@@ -508,7 +496,6 @@ publish_internal() {
 publish_release() {
     local tarball="${TAG}.tar.gz" workdir tag_key asc_key repo_slug
 
-    [[ -z $INTERNAL ]] || die "internal tags are never published as GitHub releases"
     repo_slug=$(origin_slug)
 
     workdir=$(mktemp -d -t "${TAG}.XXXXXX")
@@ -578,12 +565,6 @@ resume_release() {
     info "tag:    ${TAG}"
     info "commit: $(git log -1 --format='%h %s' "${TAG}^{commit}")"
     info "key:    $(tag_signing_key "$TAG")"
-    if [[ -n $INTERNAL ]]; then
-        echo
-        confirm "Push internal tag to origin? (no GitHub release)" || { info "aborted"; return 0; }
-        publish_internal
-        return 0
-    fi
     info "notes:  taken from the tag message"
     echo
     confirm "Push tag and create/update GitHub release?" || { info "aborted"; return 0; }
@@ -632,13 +613,7 @@ confirm "Create signed tag ${TAG}?" || { info "aborted"; exit 0; }
 create_tag
 echo
 
-if [[ -n $INTERNAL ]]; then
-    if confirm "Push internal tag to origin? (no GitHub release)"; then
-        publish_internal
-    else
-        info "tag left local - push later with: ${SCRIPT_NAME} --resume --internal ${VERSION} ${PKGREL}"
-    fi
-elif confirm "Push tag and create GitHub release?"; then
+if confirm "Push tag and create GitHub release?"; then
     publish_release
 else
     info "tag left local - publish later with: ${SCRIPT_NAME} --resume${CHANNEL:+ --${CHANNEL}} ${VERSION} ${PKGREL}"
