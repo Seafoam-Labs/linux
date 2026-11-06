@@ -158,6 +158,28 @@ static unsigned long lru_cast_zs_part(struct lruvec *lruvec, unsigned long anon)
 }
 
 /*
+ * @lruvec's part of the node's anon pinned for a device: the node's pins
+ * (taken less released, in pages: gup counts both, and an unpin shows at
+ * once) by its part of the node's anon, as lru_cast_zs_part() does for
+ * zram. Pinned pages stay on the lists but reclaim cannot take them, so
+ * what anon can give is its pages less these. The count does not tell
+ * anon from file; file pinned is rare, and then anon is taken for less
+ * than it is, for as long as the pin lasts.
+ */
+static unsigned long lru_cast_pinned_part(struct lruvec *lruvec, unsigned long anon)
+{
+	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
+	long pins = node_page_state(pgdat, NR_FOLL_PIN_ACQUIRED) -
+		    node_page_state(pgdat, NR_FOLL_PIN_RELEASED);
+	unsigned long node = node_page_state(pgdat, NR_ACTIVE_ANON) +
+			     node_page_state(pgdat, NR_INACTIVE_ANON);
+
+	if (pins <= 0 || !node)
+		return 0;
+	return min(anon, div64_u64((u64)min((unsigned long)pins, node) * anon, node));
+}
+
+/*
  * The pressure on a page of each type, as a swappiness: each type's part of
  * memory over its share, anon's against file's, no further apart than 1:199.
  * Anon's memory is its pages on the lists and those compressed in memory.
@@ -187,12 +209,19 @@ int lru_cast_pick(struct lruvec *lruvec, int swappiness, int priority, bool anon
 			     lru_cast_lru_size(lruvec, LRU_ACTIVE_ANON);
 	unsigned long file = lru_cast_lru_size(lruvec, LRU_INACTIVE_FILE) +
 			     lru_cast_lru_size(lruvec, LRU_ACTIVE_FILE);
+	unsigned long pinned = 0;
 	int pick;
 
 	if (swappiness <= 0)
 		anon_ok = false;		/* never swap: at the floor, nothing */
 	anon_ok = anon_ok && anon;
 	file_ok = file_ok && file;
+	if (anon_ok && file_ok && priority) {
+		/* what anon can give is what is not pinned; none, and file gives (not on the last pass) */
+		pinned = lru_cast_pinned_part(lruvec, anon);
+		if (pinned >= anon)
+			anon_ok = false;
+	}
 	if (anon_ok && file_ok) {
 		if (swappiness == 1)		/* file to the floor first */
 			pick = LRU_CAST_FILE;
@@ -203,7 +232,7 @@ int lru_cast_pick(struct lruvec *lruvec, int swappiness, int priority, bool anon
 		else {	/* both, pressed toward the share */
 			if (unlikely(!lru_cast_param_share_held()))
 				lru_cast_hold_share();
-			lru_cast_pressure(anon + lru_cast_zs_part(lruvec, anon), file, weight);
+			lru_cast_pressure(anon - pinned + lru_cast_zs_part(lruvec, anon), file, weight);
 			pick = LRU_CAST_BOTH;
 		}
 	} else if (anon_ok) {

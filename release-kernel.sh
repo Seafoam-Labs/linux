@@ -6,6 +6,8 @@
 #   ./release-kernel.sh 6.19.3 2            -> devario-6.19.3-2
 #   ./release-kernel.sh --dev 7.2.3         -> devario-dev-7.2.3-1
 #   ./release-kernel.sh --scx 7.2.3         -> devario-scx-7.2.3-1
+#   ./release-kernel.sh --gaming 7.3.1      -> devario-gaming-7.3.1-1
+#   ./release-kernel.sh --internal 7.3.1    -> devario-internal-7.3.1-1
 #   ./release-kernel.sh --dry-run 6.19-rc8
 
 set -euo pipefail
@@ -14,8 +16,9 @@ readonly SCRIPT_NAME=${0##*/}
 # The only repository releases may be published to. RELEASE_REPO_SLUG in the
 # environment overrides it (for test setups only).
 readonly EXPECTED_REPO_SLUG=${RELEASE_REPO_SLUG:-Seafoam-Labs/linux}
-# Release channel: "" (stable), "dev" or "scx"; set by --dev / --scx.
-# Selects the tag prefix (devario[-<channel>]) and the release title.
+# Release channel: "" (stable), "dev", "scx", "gaming" or "internal"; set by
+# --dev / --scx / --gaming / --internal. Selects the tag prefix
+# (devario[-<channel>]) and the release title.
 CHANNEL=""
 TAG_PREFIX="devario"
 RELEASE_TITLE="Devario Linux"
@@ -61,10 +64,12 @@ then optionally push it and publish a GitHub release with a signed tarball.
   RC                      devario-6.19-rc8-1
   Dev build (--dev)       devario-dev-7.2.3-1
   scx kernel (--scx)      devario-scx-7.2.3-1
+  Gaming (--gaming)       devario-gaming-7.3.1-1
+  Internal (--internal)   devario-internal-7.3.1-1
 
-Each channel (devario-*, devario-dev-*, devario-scx-*) is a separate line
-of tags: "previous release" and the changelog diff are computed only
-within the same channel.
+Each channel (devario-*, devario-dev-*, devario-scx-*, devario-gaming-*,
+devario-internal-*) is a separate line of tags: "previous release" and the
+changelog diff are computed only within the same channel.
 
 Arguments:
   kernel-version   X.Y.Z (6.19.3) or X.Y-rcN (6.19-rc8)
@@ -75,7 +80,13 @@ Options:
                    titled "Devario Linux (dev) <version>-<pkgrel>"
   -s, --scx        scx channel: tag devario-scx-<version>-<pkgrel>, release
                    titled "Devario Linux (scx) <version>-<pkgrel>"
-                   (--dev and --scx are mutually exclusive)
+  -g, --gaming     Gaming channel: tag devario-gaming-<version>-<pkgrel>,
+                   release titled "Devario Linux (gaming) <version>-<pkgrel>";
+                   a full release, but never marked "latest" on GitHub
+  -i, --internal   Internal channel: tag devario-internal-<version>-<pkgrel>,
+                   pre-release titled "Devario Linux (internal) <version>-<pkgrel>"
+                   (--dev, --scx, --gaming and --internal are mutually
+                   exclusive)
   -n, --dry-run    Only print the generated changelog, change nothing
   -y, --yes        Do not ask for confirmation
   -r, --resume     Publish an already existing local tag: verify its
@@ -98,12 +109,15 @@ Checks performed before tagging (all fatal):
 
 Publishing:
   - only to ${EXPECTED_REPO_SLUG} (origin must point there)
-  - dev/scx channels and -rc versions are created as GitHub pre-releases
+  - dev/scx/internal channels and -rc versions are created as GitHub
+    pre-releases
+  - gaming releases are full releases with --latest=false, so the stable
+    channel stays the "latest" release
 
 Recovering a half-finished publish:
   If the script fails after the tag was created (push, signing or
   'gh release' error), fix the cause and re-run with --resume:
-      ${SCRIPT_NAME} [--dev|--scx] --resume <kernel-version> [pkgrel]
+      ${SCRIPT_NAME} [--dev|--scx|--gaming|--internal] --resume <kernel-version> [pkgrel]
 
 Requirements:
   - A GPG key configured via 'git config user.signingkey' for the tag.
@@ -127,14 +141,17 @@ RESUME=0
 POSITIONAL=()
 
 set_channel() {
-    [[ -z $CHANNEL || $CHANNEL == "$1" ]] || die "--dev and --scx are mutually exclusive"
+    [[ -z $CHANNEL || $CHANNEL == "$1" ]] \
+        || die "--dev, --scx, --gaming and --internal are mutually exclusive"
     CHANNEL=$1
 }
 
 while [[ $# -gt 0 ]]; do
     case $1 in
-        -d|--dev)     set_channel dev ;;
-        -s|--scx)     set_channel scx ;;
+        -d|--dev)      set_channel dev ;;
+        -s|--scx)      set_channel scx ;;
+        -g|--gaming)   set_channel gaming ;;
+        -i|--internal) set_channel internal ;;
         -n|--dry-run) DRY_RUN=1 ;;
         -y|--yes)     ASSUME_YES=1 ;;
         -r|--resume)  RESUME=1 ;;
@@ -156,10 +173,14 @@ if [[ -n $CHANNEL ]]; then
     RELEASE_TITLE="Devario Linux (${CHANNEL})"
 fi
 readonly CHANNEL TAG_PREFIX RELEASE_TITLE
-# Only stable, non-rc releases are "latest" on GitHub.
+# Only stable, non-rc releases are "latest" on GitHub. dev/scx/internal and
+# -rc are pre-releases; gaming is a full release that is never marked latest.
 PRERELEASE=''
-[[ -n $CHANNEL || $VERSION == *-rc* ]] && PRERELEASE=1
-readonly PRERELEASE
+[[ $CHANNEL == dev || $CHANNEL == scx || $CHANNEL == internal || $VERSION == *-rc* ]] \
+    && PRERELEASE=1
+NOT_LATEST=''
+[[ $CHANNEL == gaming ]] && NOT_LATEST=1
+readonly PRERELEASE NOT_LATEST
 
 [[ -n $VERSION ]] || { usage >&2; exit 1; }
 [[ $VERSION =~ ^[0-9]+\.[0-9]+(\.[0-9]+|-rc[0-9]+)$ ]] \
@@ -441,6 +462,33 @@ create_tag() {
     ok "created signed tag ${TAG}"
 }
 
+# Prints the GitHub slug of origin; dies unless it is the release repository.
+origin_slug() {
+    local repo_slug
+    repo_slug=$(git remote get-url origin \
+        | sed -E 's#^(https://github\.com/|git@github\.com:)##; s#\.git$##')
+    [[ $repo_slug == "$EXPECTED_REPO_SLUG" ]] \
+        || die "origin is '${repo_slug}', releases go to '${EXPECTED_REPO_SLUG}' only"
+    printf '%s' "$repo_slug"
+}
+
+# Push the tag unless origin already has the very same object. Idempotent.
+push_tag() {
+    local local_oid remote_oid
+    step "Pushing tag"
+    local_oid=$(git rev-parse "refs/tags/${TAG}")
+    remote_oid=$(git ls-remote --refs origin "refs/tags/${TAG}" | cut -f1)
+    if [[ -z $remote_oid ]]; then
+        git push origin "refs/tags/${TAG}:refs/tags/${TAG}"
+    elif [[ $remote_oid == "$local_oid" ]]; then
+        info "already on origin (${remote_oid:0:12})"
+    else
+        # Never overwrite a published tag. Whoever resolves this decides
+        # which object is the real release; the script must not guess.
+        die "tag ${TAG} differs between local (${local_oid:0:12}) and origin (${remote_oid:0:12}) - refusing to publish"
+    fi
+}
+
 # Idempotent: every step is safe to repeat, so --resume can re-run it.
 # Artifacts are built in a fresh temporary directory (never next to the
 # checkout, never reusing leftovers), and local work happens before anything
@@ -448,10 +496,7 @@ create_tag() {
 publish_release() {
     local tarball="${TAG}.tar.gz" workdir tag_key asc_key repo_slug
 
-    repo_slug=$(git remote get-url origin \
-        | sed -E 's#^(https://github\.com/|git@github\.com:)##; s#\.git$##')
-    [[ $repo_slug == "$EXPECTED_REPO_SLUG" ]] \
-        || die "origin is '${repo_slug}', releases go to '${EXPECTED_REPO_SLUG}' only"
+    repo_slug=$(origin_slug)
 
     workdir=$(mktemp -d -t "${TAG}.XXXXXX")
     # shellcheck disable=SC2064  # expand now: workdir is local
@@ -477,19 +522,7 @@ publish_release() {
         || die "tarball signature key (${asc_key:-none}) does not match tag key (${tag_key})"
     ok "${tarball}.asc (key ${tag_key:(-16)})"
 
-    step "Pushing tag"
-    local local_oid remote_oid
-    local_oid=$(git rev-parse "refs/tags/${TAG}")
-    remote_oid=$(git ls-remote --refs origin "refs/tags/${TAG}" | cut -f1)
-    if [[ -z $remote_oid ]]; then
-        git push origin "refs/tags/${TAG}:refs/tags/${TAG}"
-    elif [[ $remote_oid == "$local_oid" ]]; then
-        info "already on origin (${remote_oid:0:12})"
-    else
-        # Never overwrite a published tag. Whoever resolves this decides
-        # which object is the real release; the script must not guess.
-        die "tag ${TAG} differs between local (${local_oid:0:12}) and origin (${remote_oid:0:12}) - refusing to publish"
-    fi
+    push_tag
 
     # Body only - the title line is passed separately.
     sed '1,2d' <<< "$CHANGELOG" > "${workdir}/notes.md"
@@ -501,12 +534,12 @@ publish_release() {
         gh release upload "$TAG" "${workdir}/${tarball}" "${workdir}/${tarball}.asc" \
             --repo "$repo_slug" --clobber
     else
-        step "Creating GitHub release${PRERELEASE:+ (pre-release)}"
+        step "Creating GitHub release${PRERELEASE:+ (pre-release)}${NOT_LATEST:+ (not latest)}"
         gh release create "$TAG" "${workdir}/${tarball}" "${workdir}/${tarball}.asc" \
             --repo "$repo_slug" \
             --title "$TITLE" \
             --notes-file "${workdir}/notes.md" \
-            --verify-tag ${PRERELEASE:+--prerelease}
+            --verify-tag ${PRERELEASE:+--prerelease} ${NOT_LATEST:+--latest=false}
     fi
 
     local base="https://github.com/${repo_slug}/releases/download/${TAG}"
