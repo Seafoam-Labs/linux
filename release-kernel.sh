@@ -7,6 +7,7 @@
 #   ./release-kernel.sh --dev 7.2.3         -> devario-dev-7.2.3-1
 #   ./release-kernel.sh --scx 7.2.3         -> devario-scx-7.2.3-1
 #   ./release-kernel.sh --gaming 7.3.1      -> devario-gaming-7.3.1-1
+#   ./release-kernel.sh --llm 7.3.1         -> devario-llm-7.3.1-1
 #   ./release-kernel.sh --internal 7.3.1    -> devario-internal-7.3.1-1
 #   ./release-kernel.sh --dry-run 6.19-rc8
 
@@ -16,8 +17,8 @@ readonly SCRIPT_NAME=${0##*/}
 # The only repository releases may be published to. RELEASE_REPO_SLUG in the
 # environment overrides it (for test setups only).
 readonly EXPECTED_REPO_SLUG=${RELEASE_REPO_SLUG:-Seafoam-Labs/linux}
-# Release channel: "" (stable), "dev", "scx", "gaming" or "internal"; set by
-# --dev / --scx / --gaming / --internal. Selects the tag prefix
+# Release channel: "" (stable), "dev", "scx", "gaming", "llm" or "internal";
+# set by --dev / --scx / --gaming / --llm / --internal. Selects the tag prefix
 # (devario[-<channel>]) and the release title.
 CHANNEL=""
 TAG_PREFIX="devario"
@@ -65,10 +66,11 @@ then optionally push it and publish a GitHub release with a signed tarball.
   Dev build (--dev)       devario-dev-7.2.3-1
   scx kernel (--scx)      devario-scx-7.2.3-1
   Gaming (--gaming)       devario-gaming-7.3.1-1
+  LLM (--llm)             devario-llm-7.3.1-1
   Internal (--internal)   devario-internal-7.3.1-1
 
 Each channel (devario-*, devario-dev-*, devario-scx-*, devario-gaming-*,
-devario-internal-*) is a separate line of tags: "previous release" and the
+devario-llm-*, devario-internal-*) is a separate line of tags: "previous release" and the
 changelog diff are computed only within the same channel.
 
 Arguments:
@@ -79,14 +81,18 @@ Options:
   -d, --dev        Dev channel: tag devario-dev-<version>-<pkgrel>, release
                    titled "Devario Linux (dev) <version>-<pkgrel>"
   -s, --scx        scx channel: tag devario-scx-<version>-<pkgrel>, release
-                   titled "Devario Linux (scx) <version>-<pkgrel>"
+                   titled "Devario Linux (scx) <version>-<pkgrel>";
+                   a full release, but never marked "latest" on GitHub
   -g, --gaming     Gaming channel: tag devario-gaming-<version>-<pkgrel>,
                    release titled "Devario Linux (gaming) <version>-<pkgrel>";
                    a full release, but never marked "latest" on GitHub
+  -l, --llm        LLM channel: tag devario-llm-<version>-<pkgrel>, release
+                   titled "Devario Linux (llm) <version>-<pkgrel>";
+                   a full release, but never marked "latest" on GitHub
   -i, --internal   Internal channel: tag devario-internal-<version>-<pkgrel>,
                    pre-release titled "Devario Linux (internal) <version>-<pkgrel>"
-                   (--dev, --scx, --gaming and --internal are mutually
-                   exclusive)
+                   (--dev, --scx, --gaming, --llm and --internal are
+                   mutually exclusive)
   -n, --dry-run    Only print the generated changelog, change nothing
   -y, --yes        Do not ask for confirmation
   -r, --resume     Publish an already existing local tag: verify its
@@ -109,15 +115,15 @@ Checks performed before tagging (all fatal):
 
 Publishing:
   - only to ${EXPECTED_REPO_SLUG} (origin must point there)
-  - dev/scx/internal channels and -rc versions are created as GitHub
+  - dev/internal channels and -rc versions are created as GitHub
     pre-releases
-  - gaming releases are full releases with --latest=false, so the stable
-    channel stays the "latest" release
+  - scx/gaming/llm releases are full releases with --latest=false, so the
+    stable channel stays the "latest" release
 
 Recovering a half-finished publish:
   If the script fails after the tag was created (push, signing or
   'gh release' error), fix the cause and re-run with --resume:
-      ${SCRIPT_NAME} [--dev|--scx|--gaming|--internal] --resume <kernel-version> [pkgrel]
+      ${SCRIPT_NAME} [--dev|--scx|--gaming|--llm|--internal] --resume <kernel-version> [pkgrel]
 
 Requirements:
   - A GPG key configured via 'git config user.signingkey' for the tag.
@@ -142,7 +148,7 @@ POSITIONAL=()
 
 set_channel() {
     [[ -z $CHANNEL || $CHANNEL == "$1" ]] \
-        || die "--dev, --scx, --gaming and --internal are mutually exclusive"
+        || die "--dev, --scx, --gaming, --llm and --internal are mutually exclusive"
     CHANNEL=$1
 }
 
@@ -151,6 +157,7 @@ while [[ $# -gt 0 ]]; do
         -d|--dev)      set_channel dev ;;
         -s|--scx)      set_channel scx ;;
         -g|--gaming)   set_channel gaming ;;
+        -l|--llm)      set_channel llm ;;
         -i|--internal) set_channel internal ;;
         -n|--dry-run) DRY_RUN=1 ;;
         -y|--yes)     ASSUME_YES=1 ;;
@@ -173,13 +180,12 @@ if [[ -n $CHANNEL ]]; then
     RELEASE_TITLE="Devario Linux (${CHANNEL})"
 fi
 readonly CHANNEL TAG_PREFIX RELEASE_TITLE
-# Only stable, non-rc releases are "latest" on GitHub. dev/scx/internal and
-# -rc are pre-releases; gaming is a full release that is never marked latest.
+# Only stable, non-rc releases are "latest" on GitHub. dev/internal and -rc
+# are pre-releases; scx/gaming/llm are full releases never marked latest.
 PRERELEASE=''
-[[ $CHANNEL == dev || $CHANNEL == scx || $CHANNEL == internal || $VERSION == *-rc* ]] \
-    && PRERELEASE=1
+[[ $CHANNEL == dev || $CHANNEL == internal || $VERSION == *-rc* ]] && PRERELEASE=1
 NOT_LATEST=''
-[[ $CHANNEL == gaming ]] && NOT_LATEST=1
+[[ $CHANNEL == scx || $CHANNEL == gaming || $CHANNEL == llm ]] && NOT_LATEST=1
 readonly PRERELEASE NOT_LATEST
 
 [[ -n $VERSION ]] || { usage >&2; exit 1; }
