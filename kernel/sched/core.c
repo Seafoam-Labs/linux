@@ -4596,6 +4596,10 @@ static void __sched_fork(u64 clone_flags, struct task_struct *p)
 	p->se.vlag			= 0;
 	p->se.rel_deadline		= 0;
 	INIT_LIST_HEAD(&p->se.group_node);
+#ifdef CONFIG_SCHED_POC_SELECTOR
+	/* no history yet: treat the new task's sync wakes as lies until proven */
+	p->poc_sync = POC_SYNC_INIT;
+#endif
 
 	/* A delayed task cannot be in clone(). */
 	WARN_ON_ONCE(p->se.sched_delayed);
@@ -5511,6 +5515,7 @@ context_switch(struct rq *rq, struct task_struct *prev,
 		 */
 		switch_mm_irqs_off(prev->active_mm, next->mm, next);
 		lru_gen_use_mm(next->mm);
+		lru_cast_use_mm(next->mm);
 
 		if (!prev->mm) {			// from kernel
 			/* will mmdrop_lazy_tlb() in finish_task_switch(). */
@@ -5799,6 +5804,8 @@ void sched_tick(void)
 	donor = rq->donor;
 
 	psi_account_irqtime(rq, curr, NULL);
+	/* a task that runs on without switching still sets young bits */
+	lru_cast_use_mm(curr->mm);
 
 	update_rq_clock(rq);
 	hw_pressure = arch_scale_hw_pressure(cpu_of(rq));
