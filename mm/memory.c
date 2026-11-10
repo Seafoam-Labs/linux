@@ -42,6 +42,7 @@
 #include <linux/kernel_stat.h>
 #include <linux/mm.h>
 #include <linux/mm_inline.h>
+#include <linux/lru_cast.h>
 #include <linux/sched/mm.h>
 #include <linux/sched/numa_balancing.h>
 #include <linux/sched/task.h>
@@ -4962,6 +4963,8 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 	if (folio)
 		swap_update_readahead(folio, vma, vmf->address);
 	if (!folio) {
+		/* CAST: the wait for it begins with its read (swap_read_folio()) */
+		lru_cast_wait_swapin(entry.val);
 		/* Swapin bypasses readahead for SWP_SYNCHRONOUS_IO devices */
 		if (data_race(si->flags & SWP_SYNCHRONOUS_IO))
 			folio = swapin_sync(entry, GFP_HIGHUSER_MOVABLE,
@@ -5218,6 +5221,8 @@ check_folio:
 					 rmap_flags);
 		folio_put_swap(folio, nr_pages == 1 ? page : NULL);
 	}
+	/* CAST: a read of the page, now that it has an identity */
+	lru_cast_swapin(folio);
 
 	VM_BUG_ON(!folio_test_anon(folio) ||
 			(pte_write(pte) && !PageAnonExclusive(page)));
@@ -5563,6 +5568,12 @@ static vm_fault_t __do_fault(struct vm_fault *vmf)
 	}
 
 	ret = vma->vm_ops->fault(vmf);
+	/*
+	 * CAST: the end of a wait begun in it -- filemap_fault()'s, or a
+	 * shmem swap-in -- unless it failed or was told not to wait.
+	 */
+	lru_cast_wait_end(!(ret & VM_FAULT_ERROR) &&
+			  !((ret & VM_FAULT_RETRY) && (vmf->flags & FAULT_FLAG_RETRY_NOWAIT)));
 	if (unlikely(ret & (VM_FAULT_ERROR | VM_FAULT_NOPAGE | VM_FAULT_RETRY |
 			    VM_FAULT_DONE_COW)))
 		return ret;
@@ -6325,6 +6336,10 @@ static vm_fault_t do_numa_page(struct vm_fault *vmf)
 	if (!folio || folio_is_zone_device(folio))
 		goto out_map;
 
+	/* CAST's protection fault on a sampled page, not NUMA's */
+	if (lru_cast_protfault(folio))
+		goto out_map;
+
 	nid = folio_nid(folio);
 	nr_pages = folio_nr_pages(folio);
 
@@ -6557,8 +6572,18 @@ static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
 	if (!vmf->pte)
 		return do_pte_missing(vmf);
 
-	if (!pte_present(vmf->orig_pte))
-		return do_swap_page(vmf);
+	if (!pte_present(vmf->orig_pte)) {
+		vm_fault_t ret = do_swap_page(vmf);
+
+		/*
+		 * CAST: the end of a swap-in begun in it, a refault by nature --
+		 * unless it failed or was told not to wait for it
+		 */
+		lru_cast_wait_end(!(ret & VM_FAULT_ERROR) &&
+				  !((ret & VM_FAULT_RETRY) &&
+				    (vmf->flags & FAULT_FLAG_RETRY_NOWAIT)));
+		return ret;
+	}
 
 	if (pte_protnone(vmf->orig_pte) && vma_is_accessible(vmf->vma)) {
 		/*
