@@ -258,7 +258,20 @@ void swap_read_folio(struct swap_io_ctx *ctx, struct folio *folio);
 void swap_read_submit(struct swap_io_ctx *ctx);
 void swap_write_submit(struct swap_io_ctx *ctx);
 int swap_writeout(struct swap_io_ctx *ctx, struct folio *folio);
+/* pageout()'s: may hand the folio to kcompressd with its reclaim */
+int swap_writeout_handoff(struct swap_io_ctx *ctx, struct folio *folio);
 void __swap_writepage(struct swap_io_ctx *ctx, struct folio *folio);
+/*
+ * swap_writeout_handoff(): the folio, still locked and isolated, is
+ * kcompressd's now; it writes it and finishes its reclaim
+ * (kcompressd_reclaim())
+ */
+#define SWAP_WRITEPAGE_HANDED	1
+#ifdef CONFIG_LRU_CAST
+/* CONFIG_SWAP is implied by this branch (mm/swap.h's CONFIG_SWAP gate). */
+int kcompressd(void *p);
+void kcompressd_reclaim(struct list_head *folio_list, struct pglist_data *pgdat);
+#endif
 
 /* linux/mm/swap_state.c */
 extern struct address_space swap_space __read_mostly;
@@ -424,6 +437,11 @@ static inline void swap_update_readahead(struct folio *folio,
 }
 
 static inline int swap_writeout(struct swap_io_ctx *ctx, struct folio *folio)
+{
+	return 0;
+}
+
+static inline int swap_writeout_handoff(struct swap_io_ctx *ctx, struct folio *folio)
 {
 	return 0;
 }
