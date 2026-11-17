@@ -8,6 +8,7 @@
 
 #include <linux/stddef.h>
 #include <linux/mm.h>
+#include <linux/lru_cast.h>
 #include <linux/mmzone.h>
 
 struct pglist_data *first_online_pgdat(void)
@@ -93,6 +94,7 @@ void lruvec_init(struct lruvec *lruvec)
 	list_del(&lruvec->lists[LRU_UNEVICTABLE]);
 
 	lru_gen_init_lruvec(lruvec);
+	lru_cast_init_lruvec(lruvec);
 }
 
 #if defined(CONFIG_NUMA_BALANCING) && !defined(LAST_CPUPID_NOT_IN_PAGE_FLAGS)
