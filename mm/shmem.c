@@ -66,6 +66,7 @@ static struct vfsmount *shm_mnt __ro_after_init;
 #include <linux/splice.h>
 #include <linux/security.h>
 #include <linux/swapops.h>
+#include <linux/lru_cast.h>
 #include <linux/mempolicy.h>
 #include <linux/namei.h>
 #include <linux/ctype.h>
@@ -2174,6 +2175,8 @@ static int shmem_swapin_folio(struct inode *inode, pgoff_t index,
 			*fault_type |= VM_FAULT_MAJOR;
 			count_vm_event(PGMAJFAULT);
 			count_memcg_event_mm(fault_mm, PGMAJFAULT);
+			/* CAST: a swap-in, begun with its read, ended by __do_fault() */
+			lru_cast_wait_swapin(swap.val);
 		}
 
 		/*
