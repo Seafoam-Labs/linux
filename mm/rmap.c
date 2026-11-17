@@ -990,6 +990,9 @@ static bool folio_referenced_one(struct folio *folio,
 		    pte_present(pteval)) {
 			if (lru_gen_look_around(&pvmw, nr))
 				referenced++;
+		} else if (lru_cast_enabled() && pvmw.pte) {
+			if (lru_cast_look_around(&pvmw))
+				referenced++;
 		} else if (pvmw.pte) {
 			bool young = false;
 
