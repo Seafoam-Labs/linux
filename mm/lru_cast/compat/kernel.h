@@ -74,7 +74,9 @@ static inline unsigned long lru_cast_page_flags(struct page *page)
  */
 static inline bool lru_cast_page_memcg_is(struct page *page, struct mem_cgroup *memcg)
 {
-#if LRU_CAST_CAP_OBJCG_LRU
+#if !IS_ENABLED(CONFIG_MEMCG)
+	return true;				/* one lruvec per node: every folio is its */
+#elif LRU_CAST_CAP_OBJCG_LRU
 	unsigned long data = READ_ONCE(page->memcg_data);
 	struct obj_cgroup *objcg;
 	bool is;
