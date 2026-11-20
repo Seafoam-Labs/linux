@@ -11771,6 +11771,9 @@ enum special_kfunc_type {
 	KF_bpf_arena_alloc_pages,
 	KF_bpf_arena_free_pages,
 	KF_bpf_session_is_return,
+	KF_bpf_ctz64,
+	KF_bpf_popcnt64,
+	KF_bpf_clz64,
 };
 
 BTF_ID_LIST(special_kfunc_list)
@@ -11865,6 +11868,9 @@ BTF_ID(func, bpf_session_is_return)
 #else
 BTF_ID_UNUSED
 #endif
+BTF_ID(func, bpf_ctz64)
+BTF_ID(func, bpf_popcnt64)
+BTF_ID(func, bpf_clz64)
 
 static bool is_bpf_obj_new_kfunc(u32 func_id)
 {
@@ -13780,6 +13786,31 @@ static int check_special_kfunc(struct bpf_verifier_env *env, struct bpf_call_arg
 
 static int check_return_code(struct bpf_verifier_env *env, int regno, const char *reg_name);
 
+static int scalar_bitop_return_max(struct bpf_verifier_env *env,
+				   const struct bpf_call_arg_meta *meta,
+				   int *max)
+{
+	struct bpf_reg_state *arg = &cur_regs(env)[BPF_REG_1];
+	bool scan;
+	int err;
+
+	if (meta->btf != btf_vmlinux)
+		return 0;
+	scan = meta->func_id == special_kfunc_list[KF_bpf_ctz64] ||
+	       meta->func_id == special_kfunc_list[KF_bpf_clz64];
+	if (!scan && meta->func_id != special_kfunc_list[KF_bpf_popcnt64])
+		return 0;
+	*max = 64;
+	if (scan && (reg_umin(arg) > 0 || arg->var_off.value)) {
+		/* The derived bound must retain its input dependency during pruning. */
+		err = mark_chain_precision(env, BPF_REG_1);
+		if (err)
+			return err;
+		*max = 63;
+	}
+	return 0;
+}
+
 static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			    int *insn_idx_p)
 {
@@ -13795,6 +13826,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	u32 i, nargs, ptr_type_id;
 	struct bpf_kfunc_desc *desc;
 	struct btf *desc_btf;
+	int scalar_max = -1;
 	int id;
 
 	/* skip for now, but return error when we find this in fixup_kfunc_call */
@@ -13887,6 +13919,9 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	/* Check the arguments */
 	err = check_kfunc_args(env, &meta, insn_idx);
 	if (err < 0)
+		return err;
+	err = scalar_bitop_return_max(env, &meta, &scalar_max);
+	if (err)
 		return err;
 
 	if ((is_bpf_obj_drop_kfunc(meta.func_id) ||
@@ -14056,6 +14091,11 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 
 	if (btf_type_is_scalar(t)) {
 		mark_reg_unknown(env, regs, BPF_REG_0);
+		if (scalar_max >= 0) {
+			regs[BPF_REG_0].var_off = tnum_range(0, scalar_max);
+			reg_set_urange64(&regs[BPF_REG_0], 0, scalar_max);
+			reg_bounds_sync(&regs[BPF_REG_0]);
+		}
 		if (meta.btf == btf_vmlinux && (meta.func_id == special_kfunc_list[KF_bpf_res_spin_lock] ||
 		    meta.func_id == special_kfunc_list[KF_bpf_res_spin_lock_irqsave]))
 			__mark_reg_const_zero(env, &regs[BPF_REG_0]);

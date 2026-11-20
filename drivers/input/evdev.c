@@ -14,6 +14,7 @@
 
 #include <linux/poll.h>
 #include <linux/sched.h>
+#include <linux/sched/wake_signal.h>
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
 #include <linux/mm.h>
@@ -287,8 +288,8 @@ static void evdev_pass_values(struct evdev_client *client,
 	spin_unlock(&client->buffer_lock);
 
 	if (wakeup)
-		wake_up_interruptible_poll(&client->wait,
-			EPOLLIN | EPOLLOUT | EPOLLRDNORM | EPOLLWRNORM);
+		__wake_up_flags(&client->wait, TASK_INTERRUPTIBLE, 1, WF_SCX_INPUT,
+				poll_to_key(EPOLLIN | EPOLLOUT | EPOLLRDNORM | EPOLLWRNORM));
 }
 
 /*

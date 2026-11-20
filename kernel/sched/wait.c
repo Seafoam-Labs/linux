@@ -6,6 +6,7 @@
  */
 #include "sched.h"
 #include <linux/wait_bit.h>
+#include <linux/sched/wake_signal.h>
 
 void __init_waitqueue_head(struct wait_queue_head *wq_head, const char *name, struct lock_class_key *key)
 {
@@ -148,6 +149,13 @@ int __wake_up(struct wait_queue_head *wq_head, unsigned int mode,
 }
 EXPORT_SYMBOL(__wake_up);
 
+int __wake_up_flags(struct wait_queue_head *head, unsigned int mode,
+		    int nr_exclusive, int wake_flags, void *key)
+{
+	return __wake_up_common_lock(head, mode, nr_exclusive, wake_flags, key);
+}
+EXPORT_SYMBOL_GPL(__wake_up_flags);
+
 void __wake_up_on_current_cpu(struct wait_queue_head *wq_head, unsigned int mode, void *key)
 {
 	__wake_up_common_lock(wq_head, mode, 1, WF_CURRENT_CPU, key);
@@ -167,6 +175,13 @@ void __wake_up_locked_key(struct wait_queue_head *wq_head, unsigned int mode, vo
 	__wake_up_common(wq_head, mode, 1, 0, key);
 }
 EXPORT_SYMBOL_GPL(__wake_up_locked_key);
+
+void __wake_up_locked_key_flags(struct wait_queue_head *head, unsigned int mode,
+				int wake_flags, void *key)
+{
+	__wake_up_common(head, mode, 1, wake_flags, key);
+}
+EXPORT_SYMBOL_GPL(__wake_up_locked_key_flags);
 
 /**
  * __wake_up_sync_key - wake up threads blocked on a waitqueue.
