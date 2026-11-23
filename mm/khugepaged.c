@@ -1211,6 +1211,8 @@ static enum scan_result __collapse_huge_page_swapin(struct mm_struct *mm,
 		vmf.pte = pte;
 		vmf.ptl = ptl;
 		ret = do_swap_page(&vmf);
+		/* CAST: the end of a swap-in begun in it */
+		lru_cast_wait_end(!(ret & (VM_FAULT_ERROR | VM_FAULT_RETRY)));
 		/* Which unmaps pte (after perhaps re-checking the entry) */
 		pte = NULL;
 

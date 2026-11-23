@@ -46,6 +46,7 @@
 #include <linux/sched/mm.h>
 #include <linux/page_owner.h>
 #include <linux/page_table_check.h>
+#include <linux/lru_cast.h>
 #include <linux/memcontrol.h>
 #include <linux/ftrace.h>
 #include <linux/lockdep.h>
@@ -60,6 +61,23 @@
 #include "page_alloc.h"
 #include "shuffle.h"
 #include "page_reporting.h"
+
+#ifdef CONFIG_LRU_CAST
+/* CAST: @page's state word (mm/lru_cast/core/store.c) pulled in, to be written */
+static inline void lru_cast_prefetch_word(struct page *page)
+{
+	if (lru_cast_enabled()) {
+		u32 *states = READ_ONCE(lru_cast_states);
+
+		if (states)
+			prefetchw(states + page_to_pfn(page));
+	}
+}
+#else
+static inline void lru_cast_prefetch_word(struct page *page)
+{
+}
+#endif
 
 /* Free Page Internal flags: for internal, non-pcp variants of free_pages(). */
 typedef int __bitwise fpi_t;
@@ -1413,6 +1431,7 @@ static __always_inline bool __free_pages_prepare(struct page *page,
 	}
 
 	page_cpupid_reset_last(page);
+	lru_cast_reset(page, order);	/* before the flags go: it reads one */
 	page->flags.f &= ~PAGE_FLAGS_CHECK_AT_PREP;
 	page->private = 0;
 	reset_page_owner(page, order);
@@ -1876,6 +1895,7 @@ inline void post_alloc_hook(struct page *page, unsigned int order,
 static void prep_new_page(struct page *page, unsigned int order, gfp_t gfp_flags,
 							unsigned int alloc_flags)
 {
+	lru_cast_prefetch_word(page);	/* not from a list above: asked for before it is cleared */
 	post_alloc_hook(page, order, gfp_flags, alloc_flags);
 
 	if (order && (gfp_flags & __GFP_COMP))
@@ -3362,6 +3382,13 @@ struct page *__rmqueue_pcplist(struct zone *zone, unsigned int order,
 		page = list_first_entry(list, struct page, pcp_list);
 		list_del(&page->pcp_list);
 		pcp->count -= 1 << order;
+		/*
+		 * CAST: the page this CPU takes next, its state word asked
+		 * for now: written as the page enters the LRU, it is there
+		 * by then, a page fault from now and not a page's clearing.
+		 */
+		if (!list_empty(list))
+			lru_cast_prefetch_word(list_first_entry(list, struct page, pcp_list));
 	} while (check_new_pages(page, order));
 
 	return page;
