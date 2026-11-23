@@ -1340,6 +1340,12 @@ struct task_struct {
 
 	/* VM state: */
 	struct reclaim_state		*reclaim_state;
+#ifdef CONFIG_LRU_CAST
+	/* CAST: the wait for a page to come in the task is in (mm/lru_cast/tune/cost.c) */
+	u8				lru_cast_wait;
+	u16				lru_cast_wait_where;	/* its CPU, or its device's place */
+	unsigned long			lru_cast_wait_swap;	/* the swap entry a fault waits for */
+#endif
 
 	struct io_context		*io_context;
 
