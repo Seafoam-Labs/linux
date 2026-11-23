@@ -9,6 +9,7 @@
 #include <linux/string.h>
 #include <linux/userfaultfd_k.h>
 #include <linux/swapops.h>
+#include <linux/lru_cast.h>
 
 /**
  * folio_is_file_lru - Should the folio be on a file LRU or anon LRU?
@@ -102,7 +103,8 @@ static __always_inline enum lru_list folio_lru_list(struct folio *folio)
 
 #ifdef CONFIG_LRU_GEN
 
-#ifdef CONFIG_LRU_GEN_ENABLED
+/* as mm/vmscan.c's lru_gen_caps */
+#if defined(CONFIG_LRU_GEN_ENABLED) && !defined(CONFIG_LRU_CAST)
 static inline bool lru_gen_enabled(void)
 {
 	DECLARE_STATIC_KEY_TRUE(lru_gen_caps[NR_LRU_GEN_CAPS]);
@@ -331,10 +333,13 @@ static inline bool lru_gen_del_folio(struct lruvec *lruvec, struct folio *folio,
 static __always_inline
 void lruvec_add_folio(struct lruvec *lruvec, struct folio *folio)
 {
-	enum lru_list lru = folio_lru_list(folio);
+	enum lru_list lru;
 
 	if (lru_gen_add_folio(lruvec, folio, false))
 		return;
+	if (lru_cast_add_folio(lruvec, folio, false))
+		return;
+	lru = folio_lru_list(folio);
 
 	update_lru_size(lruvec, lru, folio_zonenum(folio),
 			folio_nr_pages(folio));
@@ -345,10 +350,13 @@ void lruvec_add_folio(struct lruvec *lruvec, struct folio *folio)
 static __always_inline
 void lruvec_add_folio_tail(struct lruvec *lruvec, struct folio *folio)
 {
-	enum lru_list lru = folio_lru_list(folio);
+	enum lru_list lru;
 
 	if (lru_gen_add_folio(lruvec, folio, true))
 		return;
+	if (lru_cast_add_folio(lruvec, folio, true))
+		return;
+	lru = folio_lru_list(folio);
 
 	update_lru_size(lruvec, lru, folio_zonenum(folio),
 			folio_nr_pages(folio));

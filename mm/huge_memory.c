@@ -17,6 +17,7 @@
 #include <linux/swap.h>
 #include <linux/shrinker.h>
 #include <linux/mm_inline.h>
+#include <linux/lru_cast.h>
 #include <linux/swapops.h>
 #include <linux/backing-dev.h>
 #include <linux/dax.h>
@@ -3199,6 +3200,8 @@ static void __split_huge_page_tail(struct folio *folio, int tail,
 		prep_compound_page(page_tail, new_order);
 		folio_set_large_rmappable(new_folio);
 	}
+	/* the new folio's reads are the old one's */
+	lru_cast_copy(new_folio, folio);
 
 	/* Set has_hwpoisoned flag on new_folio if any of its pages is HWPoison */
 	if (handle_hwpoison &&

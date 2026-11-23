@@ -126,6 +126,9 @@ enum pageflags {
 #ifdef CONFIG_ARCH_USES_PG_ARCH_3
 	PG_arch_3,
 #endif
+#ifdef CONFIG_LRU_CAST
+	PG_rekey,		/* CAST: read since its key was taken */
+#endif
 	__NR_PAGEFLAGS,
 
 	PG_readahead = PG_reclaim,
@@ -591,6 +594,10 @@ FOLIO_SET_FLAG(swapcache, FOLIO_HEAD_PAGE)
 FOLIO_CLEAR_FLAG(swapcache, FOLIO_HEAD_PAGE)
 #else
 FOLIO_FLAG_FALSE(swapcache)
+#endif
+
+#ifdef CONFIG_LRU_CAST
+FOLIO_FLAG(rekey, FOLIO_HEAD_PAGE)
 #endif
 
 FOLIO_FLAG(unevictable, FOLIO_HEAD_PAGE)
